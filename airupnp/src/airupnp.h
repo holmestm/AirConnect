@@ -1,39 +1,33 @@
 /*
  *  AirUPnP - AirPlay to uPNP gateway
  *
- *	(c) Philippe 2017-, philippe_44@outlook.com
+ *	(c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * See LICENSE
  *
  */
 
-#ifndef __AIRUPNP_H
-#define __AIRUPNP_H
+#pragma once
 
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 
-#include "platform.h"
-#include "raopcore.h"
-#include "upnp.h"
 #include "pthread.h"
-#include "util.h"
+#include "upnp.h"
+
+#include "platform.h"
+#include "raop_server.h"
+#include "cross_util.h"
+#include "metadata.h"
+
+#define VERSION "v1.9.3"" ("__DATE__" @ "__TIME__")"
 
 /*----------------------------------------------------------------------------*/
 /* typedefs */
 /*----------------------------------------------------------------------------*/
+
+#define STR_LEN	256
 
 #define MAX_PROTO		128
 #define MAX_RENDERERS	32
@@ -49,60 +43,65 @@ struct sService {
 	char EventURL	[RESOURCE_LENGTH];
 	char ControlURL	[RESOURCE_LENGTH];
 	Upnp_SID		SID;
-	s32_t			TimeOut;
-	u32_t			Failed;
+	int32_t			TimeOut;
+	uint32_t			Failed;
 };
 
-typedef struct sMRConfig
+typedef struct sMRConfig
 {
-	char		StreamLength[_STR_LEN_];
+	int			HTTPLength;
 	bool		Enabled;
-	char		Name[_STR_LEN_];
+	char		Name[STR_LEN];
+	int			UPnPMax;
 	bool		SendMetaData;
 	bool		SendCoverArt;
+	bool 		Flush;
 	int			MaxVolume;
-	char		Codec[_STR_LEN_];
+	char		Codec[STR_LEN];
 	bool		Metadata;
-	char		Latency[_STR_LEN_];
+	char		Latency[STR_LEN];
 	bool		Drift;
-	u8_t		mac[6];
-	char		ArtWork[4*_STR_LEN_];
+	uint8_t		mac[6];
+	char		ArtWork[4*STR_LEN];
 } tMRConfig;
 
 struct sMR {
-	u32_t Magic;
+	uint32_t Magic;
 	bool  Running;
 	tMRConfig Config;
 	char UDN			[RESOURCE_LENGTH];
 	char DescDocURL		[RESOURCE_LENGTH];
+	char friendlyName	[STR_LEN];
 	enum eMRstate 	State;
 	bool			ExpectStop;
-	struct raop_ctx_s *Raop;
+	struct raopsr_s *Raop;
 	metadata_t		MetaData;
-	raop_event_t	RaopState;
-	u32_t			Elapsed;
-	u32_t			LastSeen;
-	u8_t			*seqN;
+	raopsr_event_t	RaopState;
+	uint32_t		Elapsed;
+	uint32_t		LastSeen;
+	uint8_t			*seqN;
 	void			*WaitCookie, *StartCookie;
-	tQueue			ActionQueue;
+	cross_queue_t	ActionQueue;
 	unsigned		TrackPoll, StatePoll;
 	struct sService Service[NB_SRV];
 	struct sAction	*Actions;
+	struct sMR		*Master;
 	pthread_mutex_t Mutex;
 	pthread_t 		Thread;
-	u8_t			Volume;
-	bool			Muted;
-	u16_t			ErrorCount;
+	double			Volume;		// to avoid int volume being stuck at 0
+	uint32_t		VolumeStampRx, VolumeStampTx;
+	int				ErrorCount;
 	bool			TimeOut;
+	char 			*ProtocolInfo;
 };
 
 extern UpnpClient_Handle   	glControlPointHandle;
-extern s32_t				glLogLimit;
+extern int32_t				glLogLimit;
 extern tMRConfig			glMRConfig;
-extern struct sMR			glMRDevices[MAX_RENDERERS];
+extern struct sMR			*glMRDevices;
+extern int					glMaxDevices;
+extern char					glBinding[128];
+extern unsigned short		glPortBase, glPortRange;
 
-int 			MasterHandler(Upnp_EventType EventType, void *Event, void *Cookie);
-int 			ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie);
-
-
-#endif
+int MasterHandler(Upnp_EventType EventType, const void *Event, void *Cookie);
+int ActionHandler(Upnp_EventType EventType, const void *Event, void *Cookie);

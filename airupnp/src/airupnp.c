@@ -1,44 +1,33 @@
 /*
  * AirUPnP - AirPlay to uPNP gateway
  *
- *	(c) Philippe 2015-2019, philippe_44@outlook.com
+ * (c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * see LICENSE
  *
  */
 
-#include <math.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#if WIN
+#include <stdio.h>
+#include <string.h>
+#include <locale.h>
+#ifdef _WIN32
 #include <process.h>
 #endif
 
 #include "platform.h"
+#include "ixmlextra.h"
 #include "airupnp.h"
+#include "mdnssvc.h"
 #include "upnpdebug.h"
-#include "upnptools.h"
-#include "util.h"
+
+#include "cross_ssl.h"
+#include "cross_net.h"
+#include "cross_log.h"
+#include "cross_thread.h"
+
 #include "avt_util.h"
 #include "config_upnp.h"
 #include "mr_util.h"
-#include "log_util.h"
-#include "sslsym.h"
-
-#define VERSION "v0.2.10.0"" ("__DATE__" @ "__TIME__")"
 
 #define	AV_TRANSPORT 			"urn:schemas-upnp-org:service:AVTransport"
 #define	RENDERING_CTRL 			"urn:schemas-upnp-org:service:RenderingControl"
@@ -46,8 +35,11 @@
 #define TOPOLOGY				"urn:schemas-upnp-org:service:ZoneGroupTopology"
 #define GROUP_RENDERING_CTRL	"urn:schemas-upnp-org:service:GroupRenderingControl"
 
-#define DISCOVERY_TIME 		20
+#define DISCOVERY_TIME 		30
 #define PRESENCE_TIMEOUT	(DISCOVERY_TIME * 6)
+
+#define MAX_DEVICES			32
+#define HTTP_FIXED_LENGTH	INT_MAX
 
 /* for the haters of GOTO statement: I'm not a big fan either, but there are
 cases where they make code more leightweight and readable, instead of tons of
@@ -58,9 +50,13 @@ of code repeating and break/continue
 /*----------------------------------------------------------------------------*/
 /* globals																	  */
 /*----------------------------------------------------------------------------*/
-s32_t  				glLogLimit = -1;
+int32_t  			glLogLimit = -1;
 UpnpClient_Handle 	glControlPointHandle;
-struct sMR			glMRDevices[MAX_RENDERERS];
+struct sMR			*glMRDevices;
+int					glMaxDevices = MAX_DEVICES;
+uint16_t			glPortBase, glPortRange;
+char				glBinding[128] = "?";
+uint16_t			glPicoPort;
 
 log_level	main_loglevel = lINFO;
 log_level	raop_loglevel = lINFO;
@@ -68,13 +64,15 @@ log_level	util_loglevel = lWARN;
 log_level	upnp_loglevel = lINFO;
 
 tMRConfig			glMRConfig = {
-							"-3",      	// StreamLength
+							-1,      	// HTTPLength
 							true,		// Enabled
 							"",      	// Name
+							1,			// UPnPMax
 							true,		// SendMetaData
 							false,		// SendCoverArt
+							true,		// Flush
 							100,		// MaxVolume
-							"flc",	    // Codec
+							"flac",	    // Codec
 							true,		// Metadata
 							"",			// RTP:HTTP Latency (0 = use AirPlay requested)
 							false,		// drift
@@ -93,15 +91,15 @@ typedef struct sUpdate {
 /*----------------------------------------------------------------------------*/
 /* consts or pseudo-const													  */
 /*----------------------------------------------------------------------------*/
-static const char 	MEDIA_RENDERER[] 	= "urn:schemas-upnp-org:device:MediaRenderer:1";
+#define MEDIA_RENDERER	"urn:schemas-upnp-org:device:MediaRenderer"
 
 static const struct cSearchedSRV_s
 {
  char 	name[RESOURCE_LENGTH];
  int	idx;
- u32_t  TimeOut;
+ uint32_t  TimeOut;
 } cSearchedSRV[NB_SRV] = {	{AV_TRANSPORT, AVT_SRV_IDX, 0},
-						{RENDERING_CTRL, REND_SRV_IDX, 30},
+						{RENDERING_CTRL, REND_SRV_IDX, 120},
 						{CONNECTION_MGR, CNX_MGR_IDX, 0},
 						{TOPOLOGY, TOPOLOGY_IDX, 0},
 						{GROUP_RENDERING_CTRL, GRP_REND_SRV_IDX, 0},
@@ -116,49 +114,54 @@ static bool	   			glDaemonize = false;
 #endif
 static bool				glMainRunning = true;
 static struct in_addr 	glHost;
-static char				glHostName[_STR_LEN_];
 static struct mdnsd*	glmDNSServer = NULL;
 static char*			glExcluded = NULL;
 static char*			glExcludedModelNumber = NULL;
-static char				*glPidFile = NULL;
+static char*			glIncludedModelNumbers = NULL;
+static char*			glPidFile = NULL;
 static bool	 			glAutoSaveConfigFile = false;
 static bool				glGracefullShutdown = true;
 static bool				glDiscovery = false;
 static pthread_mutex_t 	glUpdateMutex;
 static pthread_cond_t  	glUpdateCond;
 static pthread_t 		glMainThread, glUpdateThread;
-static tQueue			glUpdateQueue;
+static cross_queue_t	glUpdateQueue;
 static bool				glInteractive = true;
-static char				*glLogFile;
-static char				glUPnPSocket[128] = "?";
-static u32_t			glPort;
-static void				*glConfigID = NULL;
-static char				glConfigName[_STR_LEN_] = "./config.xml";
+static char*			glLogFile;
+static uint16_t			glPort;
+static void*			glConfigID = NULL;
+static char				glConfigName[STR_LEN] = "./config.xml";
+static char*			glNameFormat = "%s+";
 
 static char usage[] =
 
 			VERSION "\n"
 		   "See -t for license terms\n"
 		   "Usage: [options]\n"
-		   "  -b <server>[:<port>]\tnetwork interface and UPnP port to use \n"
-   		   "  -c <mp3[:<rate>]|flc[:0..9]|wav|pcm>\taudio format send to player\n"
-		   "  -x <config file>\tread config from file (default is ./config.xml)\n"
-		   "  -i <config file>\tdiscover players, save <config file> and exit\n"
-		   "  -I \t\t\tauto save config at every network scan\n"
-		   "  -l <[rtp][:http][:f]>\tRTP and HTTP latency (ms), ':f' forces silence fill\n"
-   		   "  -r \t\t\tlet timing reference drift (no click)\n"
-		   "  -f <logfile>\t\twrite debug to logfile\n"
-		   "  -p <pid file>\t\twrite PID in file\n"
-		   "  -m <name1,name2...>\texclude from search devices whose model name contains name1 or name 2 ...\n"
-		   "  -n <name1,name2...>\texclude from search devices whose model number contains name1 or name 2 ...\n"
-		   "  -d <log>=<level>\tSet logging level, logs: all|raop|main|util|upnp, level: error|warn|info|debug|sdebug\n"
-
+		   "  -b <ip|iface>[:<port>] network interface or interface and UPnP port to use\n"
+		   "  -a <port>[:<count>]    set inbound port and range for RTP and HTTP\n"
+		   "  -c <mp3[:<rate>]|flac[:0..9]|wav|pcm>  audio format send to player\n"
+		   "  -g <-3|-1|0>           HTTP content-length mode (-3:chunked, -1:none, 0:fixed)\n"
+		   "  -u <version>           set the maximum UPnP version for search (default 1)\n"
+		   "  -x <config file>       read config from file (default is ./config.xml)\n"
+		   "  -i <config file>       discover players, save <config file> and exit\n"
+		   "  -I                     auto save config at every network scan\n"
+		   "  -l <[rtp][:http][:f]>  RTP and HTTP latency (ms), ':f' forces silence fill\n"
+		   "  -r                     let timing reference drift (no click)\n"
+		   "  -f <logfile>           write debug to logfile\n"
+		   "  -p <pid file>          write PID in file\n"
+		   "  -N <format>            transform device name using C format (%s=name)\n"
+		   "  -m <n1,n2...>          exclude devices whose model include tokens\n"
+		   "  -n <m1,m2,...>         exclude devices whose name includes tokens\n"
+		   "  -o <m1,m2,...>         include only listed models; overrides -m and -n (use <NULL> if player don't return a model)\n"
+		   "  -d <log>=<level>       set logging level, logs: all|raop|main|util|upnp, level: error|warn|info|debug|sdebug\n"
 #if LINUX || FREEBSD
-		   "  -z \t\t\tDaemonize\n"
+		   "  -z                     daemonize\n"
 #endif
-		   "  -Z \t\t\tNOT interactive\n"
-		   "  -k \t\t\tImmediate exit on SIGQUIT and SIGTERM\n"
-		   "  -t \t\t\tLicense terms\n"
+		   "  -Z                     NOT interactive\n"
+		   "  -k                     immediate exit on SIGQUIT and SIGTERM\n"
+		   "  -t                     license terms\n"
+   		   "  --noflush              ignore flush command (wait for teardown to stop)\n"
 		   "\n"
 		   "Build options:"
 #if LINUX
@@ -218,21 +221,20 @@ static bool 	_ProcessQueue(struct sMR *Device);
 #define STATE_POLL  (500)
 #define MAX_ACTION_ERRORS (5)
 #define MIN_POLL (min(TRACK_POLL, STATE_POLL))
-static void *MRThread(void *args)
-{
+static void *MRThread(void *args) {
 	int elapsed, wakeTimer = MIN_POLL;
 	unsigned last;
 	struct sMR *p = (struct sMR*) args;
 
 	last = gettime_ms();
 
-	for (; p->Running; WakeableSleep(wakeTimer)) {
+	for (; p->Running; crossthreads_sleep(wakeTimer)) {
 		elapsed = gettime_ms() - last;
 
 		// context is valid as long as thread runs
 		pthread_mutex_lock(&p->Mutex);
-		
-		wakeTimer = (p->State != STOPPED) ? MIN_POLL : MIN_POLL * 10;
+
+		wakeTimer = (p->State != STOPPED) ? MIN_POLL / 2: MIN_POLL * 10;
 		LOG_SDEBUG("[%p]: UPnP thread timer %d %d", p, elapsed, wakeTimer);
 
 		p->StatePoll += elapsed;
@@ -240,41 +242,39 @@ static void *MRThread(void *args)
 
 		/*
 		should not request any status update if we are stopped, off or waiting
-		for an action to be performed
+		for an action to be performed or slave
 		*/
-		if ((p->RaopState != RAOP_PLAY && p->State == STOPPED) ||
-			 p->ErrorCount > MAX_ACTION_ERRORS ||
-			 p->WaitCookie) {
-			last = gettime_ms();
-			pthread_mutex_unlock(&p->Mutex);
-			continue;
-		}
+		if (p->Master || (p->RaopState != RAOP_PLAY && p->State == STOPPED) ||
+			p->ErrorCount < 0 || p->ErrorCount > MAX_ACTION_ERRORS || p->WaitCookie) goto sleep;
 
-		// get track position & CurrentURI
-		if (p->TrackPoll > TRACK_POLL) {
-			p->TrackPoll = 0;
-			if (p->State != STOPPED && p->State != PAUSED) {
-				AVTCallAction(p, "GetPositionInfo", p->seqN++);
-			}
-		}
-
-		// do polling as event is broken in many uPNP devices
+		// do polling as event is broken in many uPNP devices (not synchronously)
 		if (p->StatePoll > STATE_POLL) {
+			// get state (PLAYING, STOPPED...)
 			p->StatePoll = 0;
 			AVTCallAction(p, "GetTransportInfo", p->seqN++);
+		} else if (p->TrackPoll > TRACK_POLL) {
+			// get track position & CurrentURI
+			p->TrackPoll = 0;
+			if (p->State != STOPPED && p->State != PAUSED) AVTCallAction(p, "GetPositionInfo", p->seqN++);
 		}
 
+sleep:
 		last = gettime_ms(),
 		pthread_mutex_unlock(&p->Mutex);
 	}
+
+	// clean our stuff before exiting
+	AVTActionFlush(&p->ActionQueue);
+	LOG_INFO("[%p] player thread exited", p);
 
 	return NULL;
 }
 
 /*----------------------------------------------------------------------------*/
-void callback(void *owner, raop_event_t event, void *param)
-{
+void HandleRAOP(void *owner, raopsr_event_t event, ...) {
 	struct sMR *Device = (struct sMR*) owner;
+	va_list args;
+	va_start(args, event);
 
 	// this is async, so need to check context validity
 	if (!CheckAndLock(owner)) return;
@@ -295,52 +295,78 @@ void callback(void *owner, raop_event_t event, void *param)
 			Device->RaopState = event;
 			break;
 		case RAOP_FLUSH:
-			LOG_INFO("[%p]: Flush", Device);
-			AVTStop(Device);
-			Device->RaopState = event;
-			Device->ExpectStop = true;
+			if (Device->Config.Flush) {
+				LOG_INFO("[%p]: Flush", Device);
+				AVTStop(Device);
+				Device->ExpectStop = true;
+				Device->RaopState = event;
+            }
 			break;
 		case RAOP_PLAY: {
-			char *ProtoInfo;
-			char *uri, *mp3radio = NULL;
-
 			if (Device->RaopState != RAOP_PLAY) {
-				if (!strcasecmp(Device->Config.Codec, "pcm"))
-					ProtoInfo = "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
-				else if (!strcasecmp(Device->Config.Codec, "wav"))
-					ProtoInfo = "http-get:*:audio/wav:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
-				else if (stristr(Device->Config.Codec, "mp3")) {
-					if (*Device->Service[TOPOLOGY_IDX].ControlURL) {
-						mp3radio = "x-rincon-mp3radio://";
-						LOG_INFO("[%p]: Sonos live stream", Device);
-					}
-					ProtoInfo = "http-get:*:audio/mp3:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+				uint16_t port = va_arg(args, uint32_t);
+				char* uri, * mp3radio = "";
+				static int count;
 
-				} else
+				if ((strcasestr(Device->Config.Codec, "mp3") || strcasestr(Device->Config.Codec, "aac")) && *Device->Service[TOPOLOGY_IDX].ControlURL) {
+					mp3radio = "x-rincon-mp3radio://";
+					LOG_INFO("[%p]: Sonos live stream", Device);
+				}
 
-					ProtoInfo = "http-get:*:audio/flac:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+				char codec[16] = "flac";
+				(void) !sscanf(Device->Config.Codec, "%15[^:]", codec);
+				(void) !asprintf(&uri, "%shttp://%s:%u/stream-%u.%s", mp3radio, inet_ntoa(glHost), port, count++, codec);
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-				asprintf(&uri, "%shttp://%s:%u/stream.%s", mp3radio ? mp3radio : "",
-								inet_ntoa(glHost), *((short unsigned*) param),
-								Device->Config.Codec);
-#pragma GCC diagnostic pop
-
-				AVTSetURI(Device, uri, &Device->MetaData, ProtoInfo);
-				NFREE(uri);
+				LOG_INFO("[%p]: uPNP setURI %s (cookie %p)", Device, uri, Device->seqN);
+				AVTSetURI(Device, uri, &Device->MetaData, Device->ProtocolInfo);
+				free(uri);
 			}
 
 			AVTPlay(Device);
 
-			CtrlSetVolume(Device, Device->Volume, Device->seqN++);
+			// don't set volume, a RAOP_VOLUME will be sent by the controller
 			Device->RaopState = event;
 			break;
 		}
 		case RAOP_VOLUME: {
-			Device->Volume = *((double*) param) * Device->Config.MaxVolume;
-			CtrlSetVolume(Device, Device->Volume, Device->seqN++);
-			LOG_INFO("[%p]: Volume[0..100] %d", Device, Device->Volume);
+			// Volume sent by raop is normalized 0..1
+			double RaopVolume = va_arg(args, double);
+			int GroupVolume, i;
+			uint32_t now = gettime_ms();
+
+			// discard echo commands
+			if (now < Device->VolumeStampRx + 1000) break;
+			Device->VolumeStampTx = now;
+
+			// Sonos group volume API is unreliable, need to create our own
+			GroupVolume = CalcGroupVolume(Device);
+
+			/* Volume is kept as a double in device's context to avoid relative
+			values going to 0 and being stuck there. This works because although
+			volume is echoed from UPnP event as an integer, timing check allows
+			that echo to be discarded, so until volume is changed locally, it
+			remains a floating value which will regrow from being < 1 */
+
+			if (GroupVolume < 0) {
+				Device->Volume = RaopVolume * Device->Config.MaxVolume;
+				CtrlSetVolume(Device, Device->Volume + 0.5, Device->seqN++);
+				LOG_INFO("[%p]: Volume[0..100] %d", Device, (int) Device->Volume);
+			} else {
+				double Ratio = GroupVolume ? (RaopVolume * Device->Config.MaxVolume) / GroupVolume : 0;
+
+				// set volume for all devices
+				for (i = 0; i < glMaxDevices; i++) {
+					struct sMR *p = glMRDevices + i;
+					if (!p->Running || (p != Device && p->Master != Device)) continue;
+
+					// for standalone master, GroupVolume & Volume are identical
+					if (GroupVolume) p->Volume = min(p->Volume * Ratio, p->Config.MaxVolume);
+					else p->Volume = RaopVolume * p->Config.MaxVolume;
+
+					CtrlSetVolume(p, p->Volume + 0.5, p->seqN++);
+					LOG_INFO("[%p]: Volume[0..100] %d:%d", p, (int) p->Volume, GroupVolume);
+				}
+			}
 			break;
 		}
 		default:
@@ -352,14 +378,26 @@ void callback(void *owner, raop_event_t event, void *param)
 
 
 /*----------------------------------------------------------------------------*/
-static bool _ProcessQueue(struct sMR *Device)
-{
+void HandleHTTP(void *owner, struct key_data_s *headers, struct key_data_s *response) {
+	struct sMR *Device = (struct sMR*) owner;
+	char *p;
+
+	if (kd_lookup(headers, "getcontentFeatures.dlna.org") && (p = strcasestr(Device->ProtocolInfo, "DLNA.ORG")) != NULL) {
+		kd_add(response, "contentFeatures.dlna.org", p);
+	}
+	if ((p = kd_lookup(headers, "transferMode.dlna.org")) != NULL) {
+		kd_add(response, "transferMode.dlna.org", p);
+	}
+}
+
+/*----------------------------------------------------------------------------*/
+static bool _ProcessQueue(struct sMR *Device) {
 	struct sService *Service = &Device->Service[AVT_SRV_IDX];
 	tAction *Action;
 	int rc = 0;
 
 	Device->WaitCookie = 0;
-	if ((Action = QueueExtract(&Device->ActionQueue)) == NULL) return false;
+	if ((Action = queue_extract(&Device->ActionQueue)) == NULL) return false;
 
 	Device->WaitCookie = Device->seqN++;
 	rc = UpnpSendActionAsync(glControlPointHandle, Service->ControlURL, Service->Type,
@@ -375,13 +413,11 @@ static bool _ProcessQueue(struct sMR *Device)
 	return (rc == 0);
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void ProcessEvent(Upnp_EventType EventType, void *_Event, void *Cookie)
-{
-	struct Upnp_Event *Event = (struct Upnp_Event*) _Event;
-	struct sMR *Device = SID2Device(Event->Sid);
-	IXML_Document *VarDoc = Event->ChangedVariables;
+static void ProcessEvent(Upnp_EventType EventType, const void *_Event, void *Cookie) {
+	UpnpEvent* Event = (UpnpEvent*)_Event;
+	struct sMR *Device = SID2Device(UpnpEvent_get_SID(Event));
+	IXML_Document *VarDoc = UpnpEvent_get_ChangedVariables(Event);
 	char  *r = NULL;
 	char  *LastChange = NULL;
 
@@ -390,31 +426,27 @@ static void ProcessEvent(Upnp_EventType EventType, void *_Event, void *Cookie)
 
 	LastChange = XMLGetFirstDocumentItem(VarDoc, "LastChange", true);
 
-	if (!Device->Raop || !LastChange) {
-		LOG_SDEBUG("no RAOP device (yet) or not change for %s", Event->Sid);
-
+	if ((!Device->Raop && !Device->Master) || !LastChange) {
+		LOG_SDEBUG("no RAOP device (yet) or not change for %s", UpnpString_get_String(UpnpEvent_get_SID(Event)));
 		pthread_mutex_unlock(&Device->Mutex);
-
 		NFREE(LastChange);
-
 		return;
-
 	}
 
-
 	// Feedback volume to AirPlay controller
-
 	r = XMLGetChangeItem(VarDoc, "Volume", "channel", "Master", "val");
 	if (r) {
-		double Volume;
-		int GroupVolume = GetGroupVolume(Device);
+		struct sMR *Master = Device->Master ? Device->Master : Device;
+		double Volume = atoi(r), GroupVolume;
+		uint32_t now = gettime_ms();
 
-		Volume = (GroupVolume > 0) ? GroupVolume : atof(r);
-
-		if ((int) Volume != Device->Volume) {
-			LOG_INFO("[%p]: UPnP Volume local change %d", Device, (int) Volume);
-			Volume /=  Device->Config.MaxVolume;
-			raop_notify(Device->Raop, RAOP_VOLUME, &Volume);
+		if (Volume != (int) Device->Volume && now > Master->VolumeStampTx + 1000) {
+			Device->Volume = Volume;
+			Master->VolumeStampRx = now;
+			GroupVolume = CalcGroupVolume(Master);
+			LOG_INFO("[%p]: UPnP Volume local change %d:%d (%s)", Device, (int) Volume, (int) GroupVolume, Device->Master ? "slave": "master");
+			Volume = GroupVolume < 0 ? Volume / Device->Config.MaxVolume : GroupVolume / 100;
+			raopsr_notify(Master->Raop, RAOP_VOLUME, &Volume);
 		}
 	}
 
@@ -424,10 +456,8 @@ static void ProcessEvent(Upnp_EventType EventType, void *_Event, void *Cookie)
 	pthread_mutex_unlock(&Device->Mutex);
 }
 
-
 /*----------------------------------------------------------------------------*/
-int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
-{
+int ActionHandler(Upnp_EventType EventType, const void *Event, void *Cookie) {
 	static int recurse = 0;
 	struct sMR *p = NULL;
 
@@ -436,18 +466,16 @@ int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
 
 	switch ( EventType ) {
 		case UPNP_CONTROL_ACTION_COMPLETE: 	{
-			struct Upnp_Action_Complete *Action = (struct Upnp_Action_Complete *)Event;
-			char   *r;
-
-			p = CURL2Device(Action->CtrlUrl);
-
+			char* r;;
+			
+			p = CURL2Device(UpnpActionComplete_get_CtrlUrl(Event));
 			if (!CheckAndLock(p)) return 0;
 
-			LOG_SDEBUG("[%p]: ac %i %s (cookie %p)", p, EventType, Action->CtrlUrl, Cookie);
+			LOG_SDEBUG("[%p]: ac %i %s (cookie %p)", p, EventType, UpnpString_get_String(UpnpActionComplete_get_CtrlUrl(Event)));
 
 			// If waited action has been completed, proceed to next one if any
 			if (p->WaitCookie) {
-				const char *Resp = XMLGetLocalName(Action->ActionResult, 1);
+				const char *Resp = XMLGetLocalName(UpnpActionComplete_get_ActionResult(Event), 1);
 
 				LOG_DEBUG("[%p]: Waited action %s", p, Resp ? Resp : "<none>");
 
@@ -457,17 +485,12 @@ int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
 				p->StartCookie = p->WaitCookie;
 				_ProcessQueue(p);
 
-				/*
-				when certain waited action has been completed, the state need
-				to be re-acquired because a 'stop' state might be missed when
-				(eg) repositionning where two consecutive status update will
-				give 'playing', the 'stop' in the middle being unseen
-				*/
-				if (Resp && (!strcasecmp(Resp, "StopResponse") ||
-							 !strcasecmp(Resp, "PlayResponse") ||
-							 !strcasecmp(Resp, "PauseResponse"))) {
-					p->State = UNKNOWN;
-				}
+				/* when play action has been completed, the state need to be re-acquired because we
+				 * might have missed a state in-between. For example, while seeking there is a very
+				 * stop/play so the STOPPED state will be missed and the PLAYING event will be as
+				 * well. This should not be done for stop/pause actions otherwise we might create a fake STOPPED event state and think
+				 * we stopped when in fact it's just the re-acquisition of current state */
+				if (Resp && !strcasecmp(Resp, "PlayResponse") && p->State == PLAYING) p->State = UNKNOWN;
 
 				break;
 			}
@@ -476,22 +499,22 @@ int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
 			if (Cookie < p->StartCookie) break;
 
 			// transport state response
-			if ((r = XMLGetFirstDocumentItem(Action->ActionResult, "CurrentTransportState", true)) != NULL) {
+			if ((r = XMLGetFirstDocumentItem(UpnpActionComplete_get_ActionResult(Event), "CurrentTransportState", true)) != NULL) {
 				if (!strcmp(r, "TRANSITIONING") && p->State != TRANSITIONING) {
 					p->State = TRANSITIONING;
 					LOG_INFO("[%p]: uPNP transition", p);
 				} else if (!strcmp(r, "STOPPED") && p->State != STOPPED) {
-					if (p->RaopState == RAOP_PLAY && !p->ExpectStop) raop_notify(p->Raop, RAOP_STOP, NULL);
+					if (p->RaopState == RAOP_PLAY && !p->ExpectStop) raopsr_notify(p->Raop, RAOP_STOP, NULL);
 					p->State = STOPPED;
 					p->ExpectStop = false;
 					LOG_INFO("[%p]: uPNP stopped", p);
 				} else if (!strcmp(r, "PLAYING") && (p->State != PLAYING)) {
 					p->State = PLAYING;
-					if (p->RaopState != RAOP_PLAY) raop_notify(p->Raop, RAOP_PLAY, NULL);
+					if (p->RaopState != RAOP_PLAY) raopsr_notify(p->Raop, RAOP_PLAY, NULL);
 					LOG_INFO("[%p]: uPNP playing", p);
 				} else if (!strcmp(r, "PAUSED_PLAYBACK") && p->State != PAUSED) {
 					p->State = PAUSED;
-					if (p->RaopState == RAOP_PLAY) raop_notify(p->Raop, RAOP_PAUSE, NULL);
+					if (p->RaopState == RAOP_PLAY) raopsr_notify(p->Raop, RAOP_PAUSE, NULL);
 					LOG_INFO("[%p]: uPNP pause", p);
 				}
 			}
@@ -500,9 +523,10 @@ int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
 
 			LOG_SDEBUG("Action complete : %i (cookie %p)", EventType, Cookie);
 
-			if (Action->ErrCode != UPNP_E_SUCCESS) {
-				p->ErrorCount++;
-				LOG_ERROR("Error in action callback -- %d (cookie %p)",	Action->ErrCode, Cookie);
+			if (UpnpActionComplete_get_ErrCode(Event) != UPNP_E_SUCCESS) {
+				if (UpnpActionComplete_get_ErrCode(Event) == UPNP_E_SOCKET_CONNECT) p->ErrorCount = -1;
+				else if (p->ErrorCount >= 0) p->ErrorCount++;
+				LOG_ERROR("Error in action callback -- %d (cookie %p)", UpnpActionComplete_get_ErrCode(Event), Cookie);
 			} else {
 				p->ErrorCount = 0;
 			}
@@ -522,10 +546,8 @@ int ActionHandler(Upnp_EventType EventType, void *Event, void *Cookie)
 	return 0;
 }
 
-
 /*----------------------------------------------------------------------------*/
-int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
-{
+int MasterHandler(Upnp_EventType EventType, const void *_Event, void *Cookie) {
 	// this variable is not thread_safe and not supposed to be
 	static int recurse = 0;
 
@@ -540,23 +562,21 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 			// probably not needed now as the search happens often enough and alive comes from many other devices
 			break;
 		case UPNP_DISCOVERY_SEARCH_RESULT: {
-			struct Upnp_Discovery *Event = (struct Upnp_Discovery *) _Event;
 			tUpdate *Update = malloc(sizeof(tUpdate));
 
 			Update->Type = DISCOVERY;
-			Update->Data  = strdup(Event->Location);
-			QueueInsert(&glUpdateQueue, Update);
+			Update->Data = strdup(UpnpString_get_String(UpnpDiscovery_get_Location(_Event)));
+			queue_insert(&glUpdateQueue, Update);
 			pthread_cond_signal(&glUpdateCond);
 
 			break;
 		}
 		case UPNP_DISCOVERY_ADVERTISEMENT_BYEBYE: {
-			struct Upnp_Discovery *Event = (struct Upnp_Discovery *) _Event;
 			tUpdate *Update = malloc(sizeof(tUpdate));
 
 			Update->Type = BYE_BYE;
-			Update->Data	 = strdup(Event->DeviceId);
-			QueueInsert(&glUpdateQueue, Update);
+			Update->Data = strdup(UpnpString_get_String(UpnpDiscovery_get_DeviceID(_Event)));
+			queue_insert(&glUpdateQueue, Update);
 			pthread_cond_signal(&glUpdateCond);
 
 			break;
@@ -566,12 +586,16 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 
 			Update->Type = SEARCH_TIMEOUT;
 			Update->Data = NULL;
-			QueueInsert(&glUpdateQueue, Update);
+			queue_insert(&glUpdateQueue, Update);
 			pthread_cond_signal(&glUpdateCond);
 
 			// if there is a cookie, it's a targeted Sonos search
-			if (!Cookie)
-				UpnpSearchAsync(glControlPointHandle, DISCOVERY_TIME, MEDIA_RENDERER, NULL);
+			if (!Cookie) {
+				static int Version;
+				char SearchTopic[sizeof(MEDIA_RENDERER)+2];
+				snprintf(SearchTopic, sizeof(SearchTopic), "%s:%i", MEDIA_RENDERER, (Version++ % glMRConfig.UPnPMax) + 1);
+				UpnpSearchAsync(glControlPointHandle, DISCOVERY_TIME, SearchTopic, NULL);
+			}
 
 			break;
 		}
@@ -580,13 +604,12 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 			break;
 		case UPNP_EVENT_SUBSCRIPTION_EXPIRED:
 		case UPNP_EVENT_AUTORENEWAL_FAILED: {
-			struct Upnp_Event_Subscribe *Event = (struct Upnp_Event_Subscribe *)_Event;
 			struct sService *s;
-			struct sMR *Device = SID2Device(Event->Sid);
+			struct sMR *Device = SID2Device(UpnpEventSubscribe_get_SID(_Event));
 
 			if (!CheckAndLock(Device)) break;
 
-			s = EventURL2Service(Event->PublisherUrl, Device->Service);
+			s = EventURL2Service(UpnpEventSubscribe_get_PublisherUrl(_Event), Device->Service);
 			if (s != NULL) {
 				UpnpSubscribeAsync(glControlPointHandle, s->EventURL, s->TimeOut,
 								   MasterHandler, (void*) strdup(Device->UDN));
@@ -599,7 +622,6 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 		}
 		case UPNP_EVENT_RENEWAL_COMPLETE:
 		case UPNP_EVENT_SUBSCRIBE_COMPLETE: {
-			struct Upnp_Event_Subscribe *Event = (struct Upnp_Event_Subscribe *)_Event;
 			struct sMR *Device = UDN2Device((char*) Cookie);
 			struct sService *s;
 
@@ -607,12 +629,12 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 
 			if (!CheckAndLock(Device)) break;
 
-			s = EventURL2Service(Event->PublisherUrl, Device->Service);
+			s = EventURL2Service(UpnpEventSubscribe_get_PublisherUrl(_Event), Device->Service);
 			if (s != NULL) {
-				if (Event->ErrCode == UPNP_E_SUCCESS) {
+				if (UpnpEventSubscribe_get_ErrCode(_Event) == UPNP_E_SUCCESS) {
 					s->Failed = 0;
-					strcpy(s->SID, Event->Sid);
-					s->TimeOut = Event->TimeOut;
+					strcpy(s->SID, UpnpString_get_String(UpnpEventSubscribe_get_SID(_Event)));
+					s->TimeOut = UpnpEventSubscribe_get_TimeOut(_Event);
 					LOG_INFO("[%p]: subscribe success", Device);
 				} else if (s->Failed++ < 3) {
 					LOG_INFO("[%p]: subscribe fail, re-trying %u", Device, s->Failed);
@@ -641,47 +663,51 @@ int MasterHandler(Upnp_EventType EventType, void *_Event, void *Cookie)
 	return 0;
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void FreeUpdate(void *_Item)
-{
+static void FreeUpdate(void *_Item) {
 	tUpdate *Item = (tUpdate*) _Item;
 	NFREE(Item->Data);
 	free(Item);
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void *UpdateThread(void *args)
-{
+static void *UpdateThread(void *args) {
 	while (glMainRunning) {
 		tUpdate *Update;
+		bool Updated = false;
 
 		pthread_mutex_lock(&glUpdateMutex);
 		pthread_cond_wait(&glUpdateCond, &glUpdateMutex);
 		pthread_mutex_unlock(&glUpdateMutex);
 
-		for (; glMainRunning && (Update = QueueExtract(&glUpdateQueue)) != NULL; FreeUpdate(Update)) {
+		for (; glMainRunning && (Update = queue_extract(&glUpdateQueue)) != NULL; queue_free_item(&glUpdateQueue, Update)) {
 			struct sMR *Device;
-			int i;
-			u32_t now = gettime_ms() / 1000;
+			uint32_t now = gettime_ms() / 1000;
 
 			// UPnP end of search timer
 			if (Update->Type == SEARCH_TIMEOUT) {
 
 				LOG_DEBUG("Presence checking", NULL);
 
-				for (i = 0; i < MAX_RENDERERS; i++) {
+				for (int i = 0; i < glMaxDevices; i++) {
 					Device = glMRDevices + i;
-					if (Device->Running &&
-						((Device->LastSeen + PRESENCE_TIMEOUT) - now > PRESENCE_TIMEOUT	||
-						Device->ErrorCount > MAX_ACTION_ERRORS)) {
-
-						pthread_mutex_lock(&Device->Mutex);
-						LOG_INFO("[%p]: removing unresponsive player (%s)", Device, Device->Config.Name);
-						raop_delete(Device->Raop);
-						// device's mutex returns unlocked
-						DelMRDevice(Device);
+					if (Device->Running && (Device->ErrorCount < 0 || Device->ErrorCount > MAX_ACTION_ERRORS ||
+						(Device->State == STOPPED && now - Device->LastSeen > PRESENCE_TIMEOUT))) {
+						// if device does not answer, try to download its DescDoc
+						IXML_Document* DescDoc = NULL;
+						if (UpnpDownloadXmlDoc(Device->DescDocURL, &DescDoc) != UPNP_E_SUCCESS) {
+							pthread_mutex_lock(&Device->Mutex);
+							LOG_INFO("[%p]: removing unresponsive player (%s)", Device, Device->Config.Name);
+							raopsr_delete(Device->Raop);
+							// device's mutex returns unlocked
+							DelMRDevice(Device);
+						} else {
+							// device is in trouble, but let's renew grace period
+							Device->LastSeen = now;
+							Device->ErrorCount = 0;
+							LOG_INFO("[%p]: %s mute to discovery, but answers UPnP, so keep it", Device, Device->Config.Name);
+						}
+						if (DescDoc) ixmlDocument_free(DescDoc);
 					}
 				}
 
@@ -694,7 +720,7 @@ static void *UpdateThread(void *args)
 				if (!CheckAndLock(Device)) continue;
 
 				LOG_INFO("[%p]: renderer bye-bye: %s", Device, Device->Config.Name);
-				raop_delete(Device->Raop);
+				raopsr_delete(Device->Raop);
 				// device's mutex returns unlocked
 				DelMRDevice(Device);
 
@@ -702,49 +728,80 @@ static void *UpdateThread(void *args)
 			} else if (Update->Type == DISCOVERY) {
 				IXML_Document *DescDoc = NULL;
 				char *UDN = NULL, *ModelName = NULL, *ModelNumber = NULL;
-				int i, rc;
-
 
 				// it's a Sonos group announce, just do a targeted search and exit
-
 				if (strstr(Update->Data, "group_description")) {
-
-					for (i = 0; i < MAX_RENDERERS; i++) {
-
-						Device = glMRDevices + i;
+					for (int i = 0; i < glMaxDevices; i++) {
+   						Device = glMRDevices + i;
 						if (Device->Running && *Device->Service[TOPOLOGY_IDX].ControlURL)
 							UpnpSearchAsync(glControlPointHandle, 5, Device->UDN, Device);
 					}
 					continue;
 				}
 
-
 				// existing device ?
-				for (i = 0; i < MAX_RENDERERS; i++) {
+				for (int i = 0; i < glMaxDevices; i++) {
 					Device = glMRDevices + i;
 					if (Device->Running && !strcmp(Device->DescDocURL, Update->Data)) {
-						// special case for Sonos: remove non-master players
-						if (!isMaster(Device->UDN, &Device->Service[TOPOLOGY_IDX], NULL)) {
-							pthread_mutex_lock(&Device->Mutex);
-							LOG_INFO("[%p]: remove Sonos slave: %s", Device, Device->Config.Name);
-							raop_delete(Device->Raop);
-							DelMRDevice(Device);
-						} else {
-							Device->LastSeen = now;
-							LOG_DEBUG("[%p] UPnP keep alive: %s", Device, Device->Config.Name);
+						char *friendlyName = NULL;
+						struct sMR *Master = GetMaster(Device, &friendlyName);
+
+						Device->LastSeen = now;
+						LOG_DEBUG("[%p] UPnP keep alive: %s", Device, Device->Config.Name);
+
+						// check for name change
+						UpnpDownloadXmlDoc(Update->Data, &DescDoc);
+						if (!friendlyName) friendlyName = XMLGetFirstDocumentItem(DescDoc, "friendlyName", true);
+
+						if (friendlyName && strcmp(friendlyName, Device->friendlyName)) {
+							char* autoName = NULL;
+							(void)!asprintf(&autoName, glNameFormat, Device->friendlyName);
+							if (!strcmp(autoName, Device->Config.Name)) {
+								LOG_INFO("[%p]: Device name change %s %s", Device, friendlyName, Device->friendlyName);
+								strcpy(Device->friendlyName, friendlyName);
+								sprintf(Device->Config.Name, glNameFormat, friendlyName);
+								raopsr_update(Device->Raop, Device->Config.Name, "airupnp");
+								Updated = true;
+							}
+							NFREE(autoName);
 						}
+
+						// we are a master (or not a Sonos)
+						if (!Master && Device->Master) {
+							// slave becoming master again
+							LOG_INFO("[%p]: Sonos %s is now master", Device, Device->Config.Name);
+							pthread_mutex_lock(&Device->Mutex);
+							Device->Master = NULL;
+							Device->Raop = raopsr_create(glHost, glmDNSServer, Device->Config.Name,
+								   "airupnp", Device->Config.mac, Device->Config.Codec,
+								   Device->Config.Metadata, Device->Config.Drift, Device->Config.Flush,
+								   Device->Config.Latency, Device,
+								   HandleRAOP, HandleHTTP, glPortBase, glPortRange,
+								   Device->Config.HTTPLength ? Device->Config.HTTPLength : HTTP_FIXED_LENGTH);
+							pthread_mutex_unlock(&Device->Mutex);
+						} else if (Master && (!Device->Master || Device->Master == Device)) {
+							pthread_mutex_lock(&Device->Mutex);
+							LOG_INFO("[%p]: Sonos %s is now slave", Device, Device->Config.Name);
+							Device->Master = Master;
+							raopsr_delete(Device->Raop);
+							Device->Raop = NULL;
+							pthread_mutex_unlock(&Device->Mutex);
+						}
+
+						NFREE(friendlyName);
 						goto cleanup;
 					}
 				}
 
 				// this can take a very long time, too bad for the queue...
+				int rc;
 				if ((rc = UpnpDownloadXmlDoc(Update->Data, &DescDoc)) != UPNP_E_SUCCESS) {
-					LOG_INFO("Error obtaining description %s -- error = %d\n", Update->Data, rc);
+					LOG_DEBUG("Error obtaining description %s -- error = %d\n", Update->Data, rc);
 					goto cleanup;
 				}
 
 				// not a media renderer but maybe a Sonos group update
-				if (!XMLMatchDocumentItem(DescDoc, "deviceType", MEDIA_RENDERER)) {
+				if (!XMLMatchDocumentItem(DescDoc, "deviceType", MEDIA_RENDERER, false)) {
 					goto cleanup;
 				}
 
@@ -759,33 +816,36 @@ static void *UpdateThread(void *args)
 
 				// new device so search a free spot - as this function is not called
 				// recursively, no need to lock the device's mutex
-				for (i = 0; i < MAX_RENDERERS && glMRDevices[i].Running; i++);
+				for (Device = glMRDevices; Device->Running && Device < glMRDevices + glMaxDevices; Device++);
 
 				// no more room !
-				if (i == MAX_RENDERERS) {
-					LOG_ERROR("Too many uPNP devices (max:%u)", MAX_RENDERERS);
+				if (Device == glMRDevices + glMaxDevices) {
+					LOG_ERROR("Too many uPNP devices (max:%u)", glMaxDevices);
 					goto cleanup;
 				}
-
-				Device = &glMRDevices[i];
+				
+				Updated = true;
 
 				if (AddMRDevice(Device, UDN, DescDoc, Update->Data) && !glDiscovery) {
 					// create a new AirPlay
-					Device->Raop = raop_create(glHost, glmDNSServer, Device->Config.Name,
+					Device->Raop = raopsr_create(glHost, glmDNSServer, Device->Config.Name,
 									   "airupnp", Device->Config.mac, Device->Config.Codec,
-									   Device->Config.Metadata, Device->Config.Drift, Device->Config.Latency,
-									   Device, callback);
+									   Device->Config.Metadata, Device->Config.Drift, Device->Config.Flush,
+									   Device->Config.Latency, Device,
+									   HandleRAOP, HandleHTTP, glPortBase, glPortRange,
+									   Device->Config.HTTPLength ? Device->Config.HTTPLength : HTTP_FIXED_LENGTH);
 					if (!Device->Raop) {
 						LOG_ERROR("[%p]: cannot create RAOP instance (%s)", Device, Device->Config.Name);
 						DelMRDevice(Device);
 					}
 				}
 
-				if (glAutoSaveConfigFile || glDiscovery) {
+cleanup:
+				if (Updated && (glAutoSaveConfigFile || glDiscovery)) {
 					LOG_DEBUG("Updating configuration %s", glConfigName);
 					SaveConfig(glConfigName, glConfigID, false);
 				}
-cleanup:
+
 				NFREE(UDN);
 				NFREE(ModelName);
 				NFREE(ModelNumber);
@@ -797,21 +857,19 @@ cleanup:
 	return NULL;
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void *MainThread(void *args)
-{
+static void *MainThread(void *args) {
 	while (glMainRunning) {
 
-		WakeableSleep(30*1000);				
+		crossthreads_sleep(30*1000);				
 		if (!glMainRunning) break;
 
 		if (glLogFile && glLogLimit != - 1) {
-			u32_t size = ftell(stderr);
+			uint32_t size = ftell(stderr);
 
 			if (size > glLogLimit*1024*1024) {
-				u32_t Sum, BufSize = 16384;
-				u8_t *buf = malloc(BufSize);
+				uint32_t Sum, BufSize = 16384;
+				uint8_t *buf = malloc(BufSize);
 
 				FILE *rlog = fopen(glLogFile, "rb");
 				FILE *wlog = fopen(glLogFile, "r+b");
@@ -830,11 +888,11 @@ static void *MainThread(void *args)
 			}
 		}
 
-		// try to detect IP change when auto-detect
-		if (strstr(glUPnPSocket, "?")) {
-			struct in_addr Host;
-			Host.s_addr = get_localhost(NULL);
-			if (Host.s_addr != INADDR_ANY && Host.s_addr != glHost.s_addr) {
+		// try to detect IP change when not forced
+		if (inet_addr(glBinding) == INADDR_NONE) {
+			struct in_addr host;
+			host = get_interface(!strchr(glBinding, '?') ? glBinding : NULL, NULL, NULL);
+			if (host.s_addr != INADDR_NONE && host.s_addr != glHost.s_addr) {
 				LOG_INFO("IP change detected %s", inet_ntoa(glHost));
 				Stop(false);
 				glMainRunning = true;
@@ -846,56 +904,53 @@ static void *MainThread(void *args)
 	return NULL;
 }
 
-
 /*----------------------------------------------------------------------------*/
-static bool AddMRDevice(struct sMR *Device, char *UDN, IXML_Document *DescDoc, const char *location)
-{
+static bool AddMRDevice(struct sMR *Device, char *UDN, IXML_Document *DescDoc, const char *location) {
 	char *friendlyName = NULL;
-	int i;
-	unsigned long mac_size = 6;
-	in_addr_t ip;
+	uint32_t now = gettime_ms();
 
 	// read parameters from default then config file
 	memcpy(&Device->Config, &glMRConfig, sizeof(tMRConfig));
 	LoadMRConfig(glConfigID, UDN, &Device->Config);
 
-
 	if (!Device->Config.Enabled) return false;
 
-	// Read key elements from description document
+	// Read key elements from description document (NB: glMRConfig is fully initialized, including strings)
 	friendlyName = XMLGetFirstDocumentItem(DescDoc, "friendlyName", true);
 	if (!friendlyName || !*friendlyName) friendlyName = strdup(UDN);
 
 	LOG_SDEBUG("UDN:\t%s\nFriendlyName:\t%s", UDN,  friendlyName);
 
+	Device->Magic 		= MAGIC;
+	Device->RaopState	= RAOP_STOP;
+	Device->State 		= STOPPED;
+	Device->LastSeen	= now / 1000;
+	Device->VolumeStampRx = Device->VolumeStampTx = now - 2000;
 	Device->ExpectStop 	= false;
 	Device->TimeOut 	= false;
 	Device->WaitCookie 	= Device->StartCookie = NULL;
-	Device->Magic 		= MAGIC;
-	Device->Muted		= true;	//assume device is muted
-	Device->RaopState	= RAOP_STOP;
-	Device->State 		= STOPPED;
-	Device->LastSeen	= gettime_ms() / 1000;
 	Device->Raop 		= NULL;
 	Device->Elapsed		= 0;
 	Device->seqN		= NULL;
 	Device->TrackPoll 	= Device->StatePoll = 0;
 	Device->Volume 		= 0;
 	Device->Actions 	= NULL;
+	Device->Master		= NULL;
+	Device->ErrorCount = 0;
 
 	strcpy(Device->UDN, UDN);
 	strcpy(Device->DescDocURL, location);
 
-	memset(&Device->MetaData, 0, sizeof(metadata_t));
+	memset(&Device->MetaData, 0, sizeof(Device->MetaData));
 	memset(&Device->Service, 0, sizeof(struct sService) * NB_SRV);
 
 	/* find the different services */
-	for (i = 0; i < NB_SRV; i++) {
+	for (int i = 0; i < NB_SRV; i++) {
 		char *ServiceId = NULL, *ServiceType = NULL;
-		char *EventURL = NULL, *ControlURL = NULL;
+		char *EventURL = NULL, *ControlURL = NULL, *ServiceURL = NULL;
 
 		strcpy(Device->Service[i].Id, "");
-		if (XMLFindAndParseService(DescDoc, location, cSearchedSRV[i].name, &ServiceType, &ServiceId, &EventURL, &ControlURL)) {
+		if (XMLFindAndParseService(DescDoc, location, cSearchedSRV[i].name, &ServiceType, &ServiceId, &EventURL, &ControlURL, &ServiceURL)) {
 			struct sService *s = &Device->Service[cSearchedSRV[i].idx];
 			LOG_SDEBUG("\tservice [%s] %s %s, %s, %s", cSearchedSRV[i].name, ServiceType, ServiceId, EventURL, ControlURL);
 
@@ -910,70 +965,105 @@ static bool AddMRDevice(struct sMR *Device, char *UDN, IXML_Document *DescDoc, c
 		NFREE(ServiceType);
 		NFREE(EventURL);
 		NFREE(ControlURL);
+		NFREE(ServiceURL);
 	}
 
-	if (!isMaster(UDN, &Device->Service[TOPOLOGY_IDX], &friendlyName) ) {
-		LOG_DEBUG("[%p] skipping Sonos slave %s", Device, friendlyName);
-		NFREE(friendlyName);
-		return false;
-	}
-
-	LOG_INFO("[%p]: adding renderer (%s)", Device, friendlyName);
+	Device->Master = GetMaster(Device, &friendlyName);
+	Device->Volume = CtrlGetVolume(Device);
 
 	// set remaining items now that we are sure
-	if (*Device->Service[TOPOLOGY_IDX].ControlURL) Device->MetaData.duration = 1;
-	Device->MetaData.title = strdup("Streaming from AirConnect");
-	if (*Device->Config.ArtWork) Device->MetaData.artwork = strdup(Device->Config.ArtWork);
-	Device->Running 	= true;
-	if (!*Device->Config.Name) sprintf(Device->Config.Name, "%s+", friendlyName);
-	QueueInit(&Device->ActionQueue, false, NULL);
+	if (*Device->Service[TOPOLOGY_IDX].ControlURL) {
+		Device->MetaData.duration = 1;
+		Device->MetaData.title = "Streaming from AirConnect";
+	} else {
+		Device->MetaData.remote_title = "Streaming from AirConnect";
+    }
+	if (*Device->Config.ArtWork) Device->MetaData.artwork = Device->Config.ArtWork;
 
-	ip = ExtractIP(location);
-	if (!memcmp(Device->Config.mac, "\0\0\0\0\0\0", mac_size)) {
-		if (SendARP(ip, INADDR_ANY, Device->Config.mac, &mac_size)) {
-			u32_t hash = hash32(UDN);
+	Device->Running = true;
+	// string is already zero-terminated
+	if (friendlyName) strncpy(Device->friendlyName, friendlyName, sizeof(Device->friendlyName) - 1);
+	if (!*Device->Config.Name) sprintf(Device->Config.Name, glNameFormat, friendlyName);
+	queue_init(&Device->ActionQueue, false, NULL);
 
-			LOG_ERROR("[%p]: cannot get mac %s, creating fake %x", Device, Device->Config.Name, hash);
-			memcpy(Device->Config.mac + 2, &hash, 4);
+	// set protocolinfo (will be used for some HTTP response)
+	if (strcasestr(Device->Config.Codec, "pcm")) Device->ProtocolInfo = "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+	else if (strcasestr(Device->Config.Codec, "wav")) Device->ProtocolInfo = "http-get:*:audio/wav:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+	else if (strcasestr(Device->Config.Codec, "aac")) Device->ProtocolInfo = "http-get:*:audio/aac:DLNA.ORG_PN=AAC_ADTS;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+	else if (strcasestr(Device->Config.Codec, "mp3")) Device->ProtocolInfo = "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+	else Device->ProtocolInfo = "http-get:*:audio/flac:DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000";
+
+	if (!memcmp(Device->Config.mac, "\0\0\0\0\0\0", 6)) {
+		char ip[32];
+		uint32_t mac_size = 6;
+
+		sscanf(location, "http://%[^:]", ip);
+		if (SendARP(inet_addr(ip), INADDR_ANY, Device->Config.mac, &mac_size)) {
+			*(uint32_t*) (Device->Config.mac + 2) = hash32(Device->UDN);
+			LOG_INFO("[%p]: creating MAC", Device);
 		}
 		memset(Device->Config.mac, 0xbb, 2);
 	}
 
-	MakeMacUnique(Device);
+	// make sure MAC is unique	
+	for (int i = 0; i < glMaxDevices; i++) {
+		if (glMRDevices[i].Running && Device != glMRDevices + i && !memcmp(&glMRDevices[i].Config.mac, &Device->Config.mac, 6)) {
+			memset(Device->Config.mac, 0xbb, 2);
+			*(uint32_t*)(Device->Config.mac + 2) = hash32(Device->UDN);
+			LOG_INFO("[%p]: duplicated mac ... updating", Device);
+		}
+	}
+
+	if (Device->Master) {
+		LOG_INFO("[%p] skipping Sonos slave %s", Device, friendlyName);
+	} else {
+		LOG_INFO("[%p]: adding renderer (%s) with mac %hX%X", Device, friendlyName, *(uint16_t*)Device->Config.mac, *(uint32_t*)(Device->Config.mac + 2));
+	}
 
 	NFREE(friendlyName);
-
 	pthread_create(&Device->Thread, NULL, &MRThread, Device);
 
 	/* subscribe here, not before */
-	for (i = 0; i < NB_SRV; i++) if (Device->Service[i].TimeOut)
+	for (int i = 0; i < NB_SRV; i++) if (Device->Service[i].TimeOut)
 		UpnpSubscribeAsync(glControlPointHandle, Device->Service[i].EventURL,
 						   Device->Service[i].TimeOut, MasterHandler,
 						   (void*) strdup(UDN));
 
-	return true;
+	return (Device->Master == NULL);
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool isExcluded(char *Model, char *ModelNumber)
-{
-	char item[_STR_LEN_];
+bool isExcluded(char *Model, char *ModelNumber) {
+	char item[STR_LEN];
 	char *p = glExcluded;
 	char *q = glExcludedModelNumber;
+	char *o = glIncludedModelNumbers;
 
-	if (glExcluded) {
-	    do {
-		    sscanf(p, "%[^,]", item);
-		    if (stristr(Model, item)) return true;
-		    p += strlen(item);
-	    } while (*p++);
+	if (glIncludedModelNumbers) {
+		if (!ModelNumber) {
+			if (strcasestr(glIncludedModelNumbers, "<NULL>")) return false;
+			else return true;
+		}
+		do {
+			sscanf(o, "%[^,]", item);
+			if (!strcmp(ModelNumber, item)) return false;
+			o += strlen(item);
+		} while (*o++);
+		return true;
 	}
-	
-	if (glExcludedModelNumber) {
+
+	if (glExcluded && Model) {
+		do {
+			sscanf(p, "%[^,]", item);
+			if (strcasestr(Model, item)) return true;
+			p += strlen(item);
+		} while (*p++);
+	}
+
+	if (glExcludedModelNumber && ModelNumber) {
 	    do {
 		    sscanf(q, "%[^,]", item);
-		    if (stristr(ModelNumber, item)) return true;
+			if (strcasestr(ModelNumber, item)) return true;
 		    q += strlen(item);
 	    } while (*q++);
 	}
@@ -981,91 +1071,90 @@ bool isExcluded(char *Model, char *ModelNumber)
 	return false;
 }
 
-
 /*----------------------------------------------------------------------------*/
-static bool Start(bool cold)
-{
-	char hostname[_STR_LEN_];
-	int i, rc;
-	char IP[16] = "";
+static bool Start(bool cold) {
+	char addr[128] = "";
 
+	// sscanf does not capture empty strings
+	if (!strchr(glBinding, '?') && !sscanf(glBinding, "%[^:]:%hu", addr, &glPort)) sscanf(glBinding, ":%hu", &glPort);
+	
+	char* iface = NULL;
+	glHost = get_interface(addr, &iface, NULL);
 
-	glHost.s_addr = INADDR_ANY;
-
-	if (!strstr(glUPnPSocket, "?")) sscanf(glUPnPSocket, "%[^:]:%u", IP, &glPort);
-
-	if (!*IP) {
-		struct in_addr host;
-		host.s_addr = get_localhost(NULL);
-		strcpy(IP, inet_ntoa(host));
+	// can't find a suitable interface
+	if (glHost.s_addr == INADDR_NONE) {
+		NFREE(iface);
+		return false;
 	}
 
-	UpnpSetLogLevel(UPNP_ALL);
-	rc = UpnpInit(IP, glPort);
+	UpnpSetLogLevel(UPNP_CRITICAL);
+	// only set iface name if it's a name
+	int rc = UpnpInit2(iface, glPort);
 
+	LOG_INFO("Binding to iface %s:%hu [%s]", inet_ntoa(glHost), glPort, iface);
+	NFREE(iface);
+	
 	if (rc != UPNP_E_SUCCESS) {
-		LOG_ERROR("UPnP init failed: %d", rc);
+		LOG_ERROR("UPnP init in %s (%s) failed: %d", inet_ntoa(glHost), addr, rc);
 		goto Error;
 	}
 
 	UpnpSetMaxContentLength(60000);
-
-	S_ADDR(glHost) = inet_addr(IP);
-	gethostname(glHostName, _STR_LEN_);
-	if (!glPort) glPort = UpnpGetServerPort();
-
-	LOG_INFO("Binding to %s:%d", IP, glPort);
+	glPort = UpnpGetServerPort();
 
 	if (cold) {
 		// manually load openSSL symbols to accept multiple versions
-		if (!load_ssl_symbols()) {
+		if (!cross_ssl_load()) {
 			LOG_ERROR("Cannot load SSL libraries", NULL);
 			goto Error;
 		}
 
-		// initialize MR utils
-		InitUtils();
-
 		// mutex should *always* be valid
-		memset(&glMRDevices, 0, sizeof(glMRDevices));
-		for (i = 0; i < MAX_RENDERERS; i++)	pthread_mutex_init(&glMRDevices[i].Mutex, 0);
+		glMRDevices = calloc(glMaxDevices, sizeof(struct sMR));
+		for (int i = 0; i < glMaxDevices; i++) pthread_mutex_init(&glMRDevices[i].Mutex, 0);
 
 		/* start the main thread */
 		pthread_create(&glMainThread, NULL, &MainThread, NULL);
 	}
 
-	if (glHost.s_addr != INADDR_ANY) {
-		pthread_mutex_init(&glUpdateMutex, 0);
-		pthread_cond_init(&glUpdateCond, 0);
-		QueueInit(&glUpdateQueue, true, FreeUpdate);
-		pthread_create(&glUpdateThread, NULL, &UpdateThread, NULL);
+	pthread_mutex_init(&glUpdateMutex, 0);
+	pthread_cond_init(&glUpdateCond, 0);
+	queue_init(&glUpdateQueue, true, FreeUpdate);
+	pthread_create(&glUpdateThread, NULL, &UpdateThread, NULL);
 
-		rc = UpnpRegisterClient(MasterHandler, NULL, &glControlPointHandle);
+	rc = UpnpRegisterClient(MasterHandler, NULL, &glControlPointHandle);
+	if (rc != UPNP_E_SUCCESS) {
+		LOG_ERROR("Error registering ControlPoint: %d", rc);
+		goto Error;
+	}
 
-		if (rc != UPNP_E_SUCCESS) {
-			LOG_ERROR("Error registering ControlPoint: %d", rc);
-			goto Error;
-		}
+	glPicoPort = glPortBase;
+	http_pico_init(glHost, &glPicoPort, glPicoPort ? glPortRange : 1);
+	LOG_INFO("Starting pico HTTP server on port %hu", glPicoPort);
 
-		snprintf(hostname, _STR_LEN_, "%s.local", glHostName);
-		if ((glmDNSServer = mdnsd_start(glHost)) == NULL) goto Error;
-		mdnsd_set_hostname(glmDNSServer, hostname, glHost);
+	char hostname[STR_LEN];
+	gethostname(hostname, sizeof(hostname));
+	strcat(hostname, ".local");
+	if ((glmDNSServer = mdnsd_start(glHost, false)) == NULL) goto Error;
+	mdnsd_set_hostname(glmDNSServer, hostname, glHost);
 
-		UpnpSearchAsync(glControlPointHandle, DISCOVERY_TIME, MEDIA_RENDERER, NULL);
+	for (int i = 0; i < glMRConfig.UPnPMax; i++) {
+		char SearchTopic[sizeof(MEDIA_RENDERER)+2];
+		snprintf(SearchTopic, sizeof(SearchTopic), "%s:%i", MEDIA_RENDERER, i + 1);
+		UpnpSearchAsync(glControlPointHandle, DISCOVERY_TIME, SearchTopic, NULL);
 	}
 
 	return true;
 
 Error:
 	UpnpFinish();
+	NFREE(glMRDevices);
 	return false;
 
 }
 
-
 /*----------------------------------------------------------------------------*/
-static bool Stop(bool exit)
-{
+static bool Stop(bool exit) {
 	int i;
 
 	glMainRunning = false;
@@ -1088,7 +1177,7 @@ static bool Stop(bool exit)
 		pthread_cond_destroy(&glUpdateCond);
 
 		// remove discovered items
-		QueueFlush(&glUpdateQueue);
+		queue_flush(&glUpdateQueue);
 
 		// stop broadcasting devices
 		mdnsd_stop(glmDNSServer);
@@ -1100,32 +1189,28 @@ static bool Stop(bool exit)
 	if (exit) {
 		// simple log size management thread
 		LOG_INFO("terminate main thread ...", NULL);
-		WakeAll();
+		crossthreads_wake();
 		pthread_join(glMainThread, NULL);
 
 		// these are for sure unused now that libupnp cannot signal anything
-		for (i = 0; i < MAX_RENDERERS; i++) pthread_mutex_destroy(&glMRDevices[i].Mutex);
+		for (i = 0; i < glMaxDevices; i++) pthread_mutex_destroy(&glMRDevices[i].Mutex);
 
-		EndUtils();
-		
+		// terminate pico http server
+		http_pico_close();
+
 		if (glConfigID) ixmlDocument_free(glConfigID);
-#if WIN
-		winsock_close();
-#endif
-
-		free_ssl_symbols();
-
+		netsock_close();
+		cross_ssl_free();
 	}
 
+	free(glMRDevices);
 	return true;
 }
 
 /*---------------------------------------------------------------------------*/
 static void sighandler(int signum) {
-	int i;
-
 	if (!glGracefullShutdown) {
-		for (i = 0; i < MAX_RENDERERS; i++) {
+		for (int i = 0; i < glMaxDevices; i++) {
 			struct sMR *p = &glMRDevices[i];
 			if (p->Running && p->State == PLAYING) AVTStop(p);
 		}
@@ -1137,44 +1222,45 @@ static void sighandler(int signum) {
 	exit(0);
 }
 
-
 /*---------------------------------------------------------------------------*/
 bool ParseArgs(int argc, char **argv) {
 	char *optarg = NULL;
 	int optind = 1;
-	int i;
+	char cmdline[256] = "";
 
-#define MAXCMDLINE 256
-	char cmdline[MAXCMDLINE] = "";
-
-	for (i = 0; i < argc && (strlen(argv[i]) + strlen(cmdline) + 2 < MAXCMDLINE); i++) {
+	for (int i = 0; i < argc && (strlen(argv[i]) + strlen(cmdline) + 2 < sizeof(cmdline)); i++) {
 		strcat(cmdline, argv[i]);
 		strcat(cmdline, " ");
 	}
 
 	while (optind < argc && strlen(argv[optind]) >= 2 && argv[optind][0] == '-') {
 		char *opt = argv[optind] + 1;
-		if (strstr("bxdpifmnlc", opt) && optind < argc - 1) {
+		if (strstr("abxdpifmnolcugN", opt) && optind < argc - 1) {
 			optarg = argv[optind + 1];
 			optind += 2;
-		} else if (strstr("tzZIkr", opt)) {
+		} else if (strstr("tzZIkr", opt) || opt[0] == '-') {
 			optarg = NULL;
 			optind += 1;
-		}
-		else {
+		} else {
 			printf("%s", usage);
 			return false;
 		}
 
 		switch (opt[0]) {
 		case 'b':
-			strcpy(glUPnPSocket, optarg);
+			strcpy(glBinding, optarg);
+			break;
+		case 'a':
+			sscanf(optarg, "%hu:%hu", &glPortBase, &glPortRange);
 			break;
 		case 'f':
 			glLogFile = optarg;
 			break;
 		case 'c':
 			strcpy(glMRConfig.Codec, optarg);
+			break;
+		case 'u':
+			glMRConfig.UPnPMax = atoi(optarg);
 			break;
 		case 'i':
 			strcpy(glConfigName, optarg);
@@ -1189,6 +1275,9 @@ bool ParseArgs(int argc, char **argv) {
 		case 'Z':
 			glInteractive = false;
 			break;
+		case 'N':
+			glNameFormat = optarg;
+			break;
 		case 'k':
 			glGracefullShutdown = false;
 			break;
@@ -1201,8 +1290,14 @@ bool ParseArgs(int argc, char **argv) {
 		case 'n':
 			glExcludedModelNumber = optarg;
 			break;
+		case 'o':
+			glIncludedModelNumbers = optarg;
+			break;
 		case 'l':
 			strcpy(glMRConfig.Latency, optarg);
+			break;
+		case 'g':
+			glMRConfig.HTTPLength = atoi(optarg);
 			break;
 #if LINUX || FREEBSD
 		case 'z':
@@ -1234,6 +1329,9 @@ bool ParseArgs(int argc, char **argv) {
 		case 't':
 			printf("%s", license);
 			return false;
+		case '-':
+			if (!strcmp(opt + 1, "noflush")) glMRConfig.Flush = false;
+			break;
 		default:
 			break;
 		}
@@ -1242,15 +1340,10 @@ bool ParseArgs(int argc, char **argv) {
 	return true;
 }
 
-
 /*----------------------------------------------------------------------------*/
 /*																			  */
 /*----------------------------------------------------------------------------*/
-int main(int argc, char *argv[])
-{
-	int i;
-	char resp[20] = "";
-
+int main(int argc, char *argv[]) {
 	signal(SIGINT, sighandler);
 	signal(SIGTERM, sighandler);
 #if defined(SIGQUIT)
@@ -1263,12 +1356,13 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
-#if WIN
-	winsock_init();
-#endif
+	// otherwise some atof/strtod fail with '.'
+	setlocale(LC_NUMERIC, "C");
+
+	netsock_init();
 
 	// first try to find a config file on the command line
-	for (i = 1; i < argc; i++) {
+	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-x")) {
 			strcpy(glConfigName, argv[i+1]);
 		}
@@ -1280,17 +1374,19 @@ int main(int argc, char *argv[])
 	// potentially overwrite with some cmdline parameters
 	if (!ParseArgs(argc, argv)) exit(1);
 
+	// make sure port range is correct
+	if (glPortBase && !glPortRange) glPortRange = glMaxDevices*4;
+
 	if (glLogFile) {
 		if (!freopen(glLogFile, "a", stderr)) {
 			fprintf(stderr, "error opening logfile %s: %s\n", glLogFile, strerror(errno));
 		}
 	}
 
-	LOG_ERROR("Starting airupnp version: %s", VERSION);
+	LOG_WARN("Starting airupnp version: %s", VERSION);
 
 	if (strtod("0.30", NULL) != 0.30) {
-		LOG_ERROR("Wrong GLIBC version, use -static build", NULL);
-		exit(1);
+		LOG_WARN("weird GLIBC, try -static build in case of failure");
 	}
 
 	if (!glConfigID) {
@@ -1317,7 +1413,7 @@ int main(int argc, char *argv[])
 		FILE *pid_file;
 		pid_file = fopen(glPidFile, "wb");
 		if (pid_file) {
-			fprintf(pid_file, "%d", getpid());
+			fprintf(pid_file, "%ld", (long) getpid());
 			fclose(pid_file);
 		}
 		else {
@@ -1326,21 +1422,19 @@ int main(int argc, char *argv[])
 	}
 
 	if (!Start(true)) {
-
 		LOG_ERROR("Cannot start", NULL);
 		exit(1);
 	}
 
-	while (strcmp(resp, "exit")) {
-
+	for (char resp[20] = ""; strcmp(resp, "exit");) {
 #if LINUX || FREEBSD || SUNOS
 		if (!glDaemonize && glInteractive)
-			i = scanf("%s", resp);
+			(void)! scanf("%s", resp);
 		else
 			pause();
 #else
 		if (glInteractive)
-			i = scanf("%s", resp);
+			(void)! scanf("%s", resp);
 		else
 #if OSX
 			pause();
@@ -1348,46 +1442,44 @@ int main(int argc, char *argv[])
 			Sleep(INFINITE);
 #endif
 #endif
+		char level[20];
 
 		if (!strcmp(resp, "raopdbg"))	{
-			char level[20];
-			i = scanf("%s", level);
+			(void)! scanf("%s", level);
 			raop_loglevel = debug2level(level);
 		}
 
 		if (!strcmp(resp, "maindbg"))	{
-			char level[20];
-			i = scanf("%s", level);
+			(void)! scanf("%s", level);
 			main_loglevel = debug2level(level);
 		}
 
 		if (!strcmp(resp, "utildbg"))	{
-			char level[20];
-			i = scanf("%s", level);
+			(void)! scanf("%s", level);
 			util_loglevel = debug2level(level);
 		}
 
 		if (!strcmp(resp, "upnpdbg"))	{
-			char level[20];
-			i = scanf("%s", level);
+			(void)! scanf("%s", level);
 			upnp_loglevel = debug2level(level);
 		}
 
 		if (!strcmp(resp, "save"))	{
 			char name[128];
-			i = scanf("%s", name);
+			(void)! scanf("%s", name);
 			SaveConfig(name, glConfigID, true);
 		}
 
 		if (!strcmp(resp, "dump") || !strcmp(resp, "dumpall"))	{
-			u32_t now = gettime_ms() / 1000;
+			uint32_t now = gettime_ms() / 1000;
 			bool all = !strcmp(resp, "dumpall");
 
-			for (i = 0; i < MAX_RENDERERS; i++) {
+			for (int i = 0; i < glMaxDevices; i++) {
 				struct sMR *p = &glMRDevices[i];
-				bool Locked = pthread_mutex_trylock(&p->Mutex);
 
+				bool Locked = pthread_mutex_trylock(&p->Mutex);
 				if (!Locked) pthread_mutex_unlock(&p->Mutex);
+
 				if (!p->Running && !all) continue;
 				printf("%20.20s [r:%u] [l:%u] [s:%u] Last:%u eCnt:%u\n",
 						p->Config.Name, p->Running, Locked, p->State,
@@ -1395,7 +1487,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-	}
+	};
 
 	// must be protected in case this interrupts a UPnPEventProcessing
 	LOG_INFO("stopping devices ...", NULL);

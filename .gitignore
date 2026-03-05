@@ -3,6 +3,7 @@
 *.lo
 *.o
 *.obj
+RC*
 
 # Precompiled Headers
 *.gch
@@ -85,7 +86,8 @@ __history
 /package*.*
 _backup/
 *.pcm
-*.*proj
+*.cbproj
+*.groupproj
 *.zip
 *.z
 *.local
@@ -94,11 +96,23 @@ _backup/
 *.i??
 *.map
 *.tds
-*.xml
 *-idx*
 *.save*
-*.xml
 *.pcm
 *.#*
 *.bin
 *.log
+*.bak
+*.pdb
+*.user
+tests/
+bin/bcc/
+bin/msvc
+.vs/
+__recovery/
+*.sln
+build/
+air*/bin
+*.bat
+bin/
+!AirConnect*.zip

@@ -1,73 +1,51 @@
 /*
- *  AirConnect: Chromecast & UPnP to AirPlay
+ * AirUPnP - Config utils
  *
- *  (c) Philippe 2016-2017, philippe_44@outlook.com
+ * (c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * see LICENSE
  *
  */
 
+#include <stdlib.h>
+#include <string.h>
 #include <stdarg.h>
 
 #include "platform.h"
+#include "ixmlextra.h"
+#include "cross_log.h"
 #include "airupnp.h"
-#include "util.h"
 #include "config_upnp.h"
-#include "log_util.h"
-#include "upnptools.h"
 
 /*----------------------------------------------------------------------------*/
 /* locals */
 /*----------------------------------------------------------------------------*/
-
 extern log_level 	main_loglevel;
 extern log_level 	util_loglevel;
 extern log_level	raop_loglevel;
 extern log_level	upnp_loglevel;
 
-
 /*----------------------------------------------------------------------------*/
-void SaveConfig(char *name, void *ref, bool full)
-{
+void SaveConfig(char *name, void *ref, bool full) {
 	struct sMR *p;
 	IXML_Document *doc = ixmlDocument_createDocument();
 	IXML_Document *old_doc = ref;
-	IXML_Node	 *root, *common;
-	IXML_NodeList *list;
-	IXML_Element *old_root;
-	char *s;
-	FILE *file;
-	int i;
-
-	old_root = ixmlDocument_getElementById(old_doc, "airupnp");
+	IXML_Node *root, *common;
+	IXML_Element* old_root = ixmlDocument_getElementById(old_doc, "airupnp");
 
 	if (!full && old_doc) {
 		ixmlDocument_importNode(doc, (IXML_Node*) old_root, true, &root);
 		ixmlNode_appendChild((IXML_Node*) doc, root);
 
-		list = ixmlDocument_getElementsByTagName((IXML_Document*) root, "device");
-		for (i = 0; i < (int) ixmlNodeList_length(list); i++) {
-			IXML_Node *device;
-
-			device = ixmlNodeList_item(list, i);
+		IXML_NodeList* list = ixmlDocument_getElementsByTagName((IXML_Document*) root, "device");
+		for (int i = 0; i < (int) ixmlNodeList_length(list); i++) {
+			IXML_Node *device = ixmlNodeList_item(list, i);
 			ixmlNode_removeChild(root, device, &device);
 			ixmlNode_free(device);
 		}
 		if (list) ixmlNodeList_free(list);
 		common = (IXML_Node*) ixmlDocument_getElementById((IXML_Document*) root, "common");
-	}
-	else {
+	} else {
 		root = XMLAddNode(doc, NULL, "airupnp", NULL);
 		common = (IXML_Node*) XMLAddNode(doc, root, "common", NULL);
 	}
@@ -76,18 +54,24 @@ void SaveConfig(char *name, void *ref, bool full)
 	XMLUpdateNode(doc, root, false, "upnp_log",level2debug(upnp_loglevel));
 	XMLUpdateNode(doc, root, false, "util_log",level2debug(util_loglevel));
 	XMLUpdateNode(doc, root, false, "raop_log",level2debug(raop_loglevel));
-	XMLUpdateNode(doc, root, false, "log_limit", "%d", (s32_t) glLogLimit);
+	XMLUpdateNode(doc, root, false, "log_limit", "%d", (int32_t) glLogLimit);
+	XMLUpdateNode(doc, root, false, "max_players", "%d", (int) glMaxDevices);
+	XMLUpdateNode(doc, root, false, "binding", glBinding);
+	XMLUpdateNode(doc, root, false, "ports", "%hu:%hu", glPortBase, glPortRange);
 
 	XMLUpdateNode(doc, common, false, "enabled", "%d", (int) glMRConfig.Enabled);
 	XMLUpdateNode(doc, common, false, "max_volume", "%d", glMRConfig.MaxVolume);
+	XMLUpdateNode(doc, common, false, "http_length", "%d", glMRConfig.HTTPLength);
+	XMLUpdateNode(doc, common, false, "upnp_max", "%d", glMRConfig.UPnPMax);
 	XMLUpdateNode(doc, common, false, "codec", glMRConfig.Codec);
 	XMLUpdateNode(doc, common, false, "metadata", "%d", glMRConfig.Metadata);
-	XMLUpdateNode(doc, common, false, "artwork", glMRConfig.ArtWork);
+	XMLUpdateNode(doc, common, false, "flush", "%d", glMRConfig.Flush);
+	XMLUpdateNode(doc, common, false, "artwork", "%s", glMRConfig.ArtWork);
 	XMLUpdateNode(doc, common, false, "latency", glMRConfig.Latency);
 	XMLUpdateNode(doc, common, false, "drift", "%d", glMRConfig.Drift);
 
 	// mutex is locked here so no risk of a player being destroyed in our back
-	for (i = 0; i < MAX_RENDERERS; i++) {
+	for (int i = 0; i < glMaxDevices; i++) {
 		IXML_Node *dev_node;
 
 		if (!glMRDevices[i].Running) continue;
@@ -105,8 +89,8 @@ void SaveConfig(char *name, void *ref, bool full)
 	}
 
 	// add devices in old XML file that has not been discovered
-	list = ixmlDocument_getElementsByTagName((IXML_Document*) old_root, "device");
-	for (i = 0; i < (int) ixmlNodeList_length(list); i++) {
+	IXML_NodeList* list = ixmlDocument_getElementsByTagName((IXML_Document*) old_root, "device");
+	for (int i = 0; i < (int) ixmlNodeList_length(list); i++) {
 		char *udn;
 		IXML_Node *device, *node;
 
@@ -121,8 +105,8 @@ void SaveConfig(char *name, void *ref, bool full)
 	}
 	if (list) ixmlNodeList_free(list);
 
-	file = fopen(name, "wb");
-	s = ixmlDocumenttoString(doc);
+	FILE* file = fopen(name, "wb");
+	char *s = ixmlDocumenttoString(doc);
 	fwrite(s, 1, strlen(s), file);
 	fclose(file);
 	free(s);
@@ -130,17 +114,18 @@ void SaveConfig(char *name, void *ref, bool full)
 	ixmlDocument_free(doc);
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void LoadConfigItem(tMRConfig *Conf, char *name, char *val)
-{
+static void LoadConfigItem(tMRConfig *Conf, char *name, char *val) {
 	if (!val) return;
 
 	if (!strcmp(name, "enabled")) Conf->Enabled = atoi(val);
 	if (!strcmp(name, "max_volume")) Conf->MaxVolume = atoi(val);
+	if (!strcmp(name, "http_length")) Conf->HTTPLength = atoi(val);
+	if (!strcmp(name, "upnp_max")) Conf->UPnPMax = atoi(val);
 	if (!strcmp(name, "use_flac")) strcpy(Conf->Codec, "flac");  // temporary
 	if (!strcmp(name, "codec")) strcpy(Conf->Codec, val);
 	if (!strcmp(name, "metadata")) Conf->Metadata = atoi(val);
+	if (!strcmp(name, "flush")) Conf->Flush = atoi(val);
 	if (!strcmp(name, "artwork")) strcpy(Conf->ArtWork, val);
 	if (!strcmp(name, "latency")) strcpy(Conf->Latency, val);
 	if (!strcmp(name, "drift")) Conf->Drift = atoi(val);
@@ -155,8 +140,7 @@ static void LoadConfigItem(tMRConfig *Conf, char *name, char *val)
 }
 
 /*----------------------------------------------------------------------------*/
-static void LoadGlobalItem(char *name, char *val)
-{
+static void LoadGlobalItem(char *name, char *val) {
 	if (!val) return;
 
 	if (!strcmp(name, "main_log")) main_loglevel = debug2level(val);
@@ -164,26 +148,22 @@ static void LoadGlobalItem(char *name, char *val)
 	if (!strcmp(name, "util_log")) util_loglevel = debug2level(val);
 	if (!strcmp(name, "raop_log")) raop_loglevel = debug2level(val);
 	if (!strcmp(name, "log_limit")) glLogLimit = atol(val);
+	if (!strcmp(name, "max_players")) glMaxDevices = atol(val);
+	if (!strcmp(name, "binding")) strcpy(glBinding, val);
+	if (!strcmp(name, "ports")) sscanf(val, "%hu:%hu", &glPortBase, &glPortRange);
  }
 
-
 /*----------------------------------------------------------------------------*/
-void *FindMRConfig(void *ref, char *UDN)
-{
-	IXML_Element *elm;
+void *FindMRConfig(void *ref, char *UDN) {
 	IXML_Node	*device = NULL;
-	IXML_NodeList *l1_node_list;
 	IXML_Document *doc = (IXML_Document*) ref;
-	char *v;
-	unsigned i;
+	IXML_Element* elm = ixmlDocument_getElementById(doc, "airupnp");
+	IXML_NodeList* l1_node_list = ixmlDocument_getElementsByTagName((IXML_Document*) elm, "udn");
 
-	elm = ixmlDocument_getElementById(doc, "airupnp");
-	l1_node_list = ixmlDocument_getElementsByTagName((IXML_Document*) elm, "udn");
-	for (i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
-		IXML_Node *l1_node, *l1_1_node;
-		l1_node = ixmlNodeList_item(l1_node_list, i);
-		l1_1_node = ixmlNode_getFirstChild(l1_node);
-		v = (char*) ixmlNode_getNodeValue(l1_1_node);
+	for (unsigned i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
+		IXML_Node* l1_node = ixmlNodeList_item(l1_node_list, i);
+		IXML_Node* l1_1_node = ixmlNode_getFirstChild(l1_node);
+		char* v = (char*) ixmlNode_getNodeValue(l1_1_node);
 		if (v && !strcmp(v, UDN)) {
 			device = ixmlNode_getParentNode(l1_node);
 			break;
@@ -194,23 +174,17 @@ void *FindMRConfig(void *ref, char *UDN)
 }
 
 /*----------------------------------------------------------------------------*/
-void *LoadMRConfig(void *ref, char *UDN, tMRConfig *Conf)
-{
-	IXML_NodeList *node_list;
+void *LoadMRConfig(void *ref, char *UDN, tMRConfig *Conf) {
 	IXML_Document *doc = (IXML_Document*) ref;
-	IXML_Node *node;
-	char *n, *v;
-	unsigned i;
+	IXML_Node* node = (IXML_Node*) FindMRConfig(doc, UDN);
 
-	node = (IXML_Node*) FindMRConfig(doc, UDN);
 	if (node) {
-		node_list = ixmlNode_getChildNodes(node);
-		for (i = 0; i < ixmlNodeList_length(node_list); i++) {
-			IXML_Node *l1_node, *l1_1_node;
-			l1_node = ixmlNodeList_item(node_list, i);
-			n = (char*) ixmlNode_getNodeName(l1_node);
-			l1_1_node = ixmlNode_getFirstChild(l1_node);
-			v = (char*) ixmlNode_getNodeValue(l1_1_node);
+		IXML_NodeList* node_list = ixmlNode_getChildNodes(node);
+		for (unsigned i = 0; i < ixmlNodeList_length(node_list); i++) {
+			IXML_Node* l1_node = ixmlNodeList_item(node_list, i);
+			char* n = (char*) ixmlNode_getNodeName(l1_node);
+			IXML_Node* l1_1_node = ixmlNode_getFirstChild(l1_node);
+			char *v = (char*) ixmlNode_getNodeValue(l1_1_node);
 			LoadConfigItem(Conf, n, v);
 		}
 		if (node_list) ixmlNodeList_free(node_list);
@@ -220,26 +194,18 @@ void *LoadMRConfig(void *ref, char *UDN, tMRConfig *Conf)
 }
 
 /*----------------------------------------------------------------------------*/
-void *LoadConfig(char *name, tMRConfig *Conf)
-{
-	IXML_Element *elm;
-	IXML_Document	*doc;
-
-	doc = ixmlLoadDocument(name);
+void *LoadConfig(char *name, tMRConfig *Conf) {
+	IXML_Document* doc = ixmlLoadDocument(name);
 	if (!doc) return NULL;
 
-	elm = ixmlDocument_getElementById(doc, "airupnp");
+	IXML_Element* elm = ixmlDocument_getElementById(doc, "airupnp");
 	if (elm) {
-		unsigned i;
-		char *n, *v;
-		IXML_NodeList *l1_node_list;
-		l1_node_list = ixmlNode_getChildNodes((IXML_Node*) elm);
-		for (i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
-			IXML_Node *l1_node, *l1_1_node;
-			l1_node = ixmlNodeList_item(l1_node_list, i);
-			n = (char*) ixmlNode_getNodeName(l1_node);
-			l1_1_node = ixmlNode_getFirstChild(l1_node);
-			v = (char*) ixmlNode_getNodeValue(l1_1_node);
+		IXML_NodeList* l1_node_list = ixmlNode_getChildNodes((IXML_Node*) elm);
+		for (unsigned i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
+			IXML_Node* l1_node = ixmlNodeList_item(l1_node_list, i);
+			char* n = (char*) ixmlNode_getNodeName(l1_node);
+			IXML_Node* l1_1_node = ixmlNode_getFirstChild(l1_node);
+			char *v = (char*) ixmlNode_getNodeValue(l1_1_node);
 			LoadGlobalItem(n, v);
 		}
 		if (l1_node_list) ixmlNodeList_free(l1_node_list);
@@ -247,20 +213,30 @@ void *LoadConfig(char *name, tMRConfig *Conf)
 
 	elm = ixmlDocument_getElementById((IXML_Document	*)elm, "common");
 	if (elm) {
-		char *n, *v;
-		IXML_NodeList *l1_node_list;
-		unsigned i;
-		l1_node_list = ixmlNode_getChildNodes((IXML_Node*) elm);
-		for (i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
-			IXML_Node *l1_node, *l1_1_node;
-			l1_node = ixmlNodeList_item(l1_node_list, i);
-			n = (char*) ixmlNode_getNodeName(l1_node);
-			l1_1_node = ixmlNode_getFirstChild(l1_node);
-			v = (char*) ixmlNode_getNodeValue(l1_1_node);
+		IXML_NodeList* l1_node_list = ixmlNode_getChildNodes((IXML_Node*) elm);
+		for (unsigned i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
+			IXML_Node* l1_node = ixmlNodeList_item(l1_node_list, i);
+			char* n = (char*) ixmlNode_getNodeName(l1_node);
+			IXML_Node* l1_1_node = ixmlNode_getFirstChild(l1_node);
+			char *v = (char*) ixmlNode_getNodeValue(l1_1_node);
 			LoadConfigItem(&glMRConfig, n, v);
 		}
 		if (l1_node_list) ixmlNodeList_free(l1_node_list);
 	}
+
+	elm = ixmlDocument_getElementById((IXML_Document*)elm, "protocolInfo");
+	if (elm) {
+		IXML_NodeList* l1_node_list = ixmlNode_getChildNodes((IXML_Node*) elm);
+		for (unsigned i = 0; i < ixmlNodeList_length(l1_node_list); i++) {
+			IXML_Node* l1_node = ixmlNodeList_item(l1_node_list, i);
+			char* n = (char*) ixmlNode_getNodeName(l1_node);
+			IXML_Node* l1_1_node = ixmlNode_getFirstChild(l1_node);
+			char* v = (char*) ixmlNode_getNodeValue(l1_1_node);
+			LoadConfigItem(&glMRConfig, n, v);
+		}
+		if (l1_node_list) ixmlNodeList_free(l1_node_list);
+	}
+
 
 	return doc;
 }

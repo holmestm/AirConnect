@@ -1,98 +1,109 @@
 /*
- *  Chromecast control utils
+ *  Chromecast misc utils
  *
- *  (c) Philippe 2016-2017, philippe_44@outlook.com
+ *  (c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * See LICENSE
  *
  */
 
-
 #include <stdlib.h>
-#include <math.h>
 
 #include "platform.h"
-#include "log_util.h"
-#include "util.h"
+#include "metadata.h"
+#include "cross_log.h"
 #include "castcore.h"
 #include "cast_util.h"
+#include "castitf.h"
 
 extern log_level cast_loglevel;
 static log_level *loglevel = &cast_loglevel;
 
 /*----------------------------------------------------------------------------*/
-bool CastIsConnected(void *p)
-{
-	tCastCtx *Ctx = (tCastCtx*) p;
-	bool status;
+static json_t* BuildMetaData(struct metadata_s* MetaData) {
+	if (!MetaData) return NULL;
 
-	pthread_mutex_lock(&Ctx->Mutex);
-	status = (Ctx->ssl != NULL);
-	pthread_mutex_unlock(&Ctx->Mutex);
-	return status;
+	json_t* json = json_pack("{si,ss,ss,ss,ss,si}",
+		"metadataType", 3,
+		"albumName", MetaData->album, "title", MetaData->title,
+		"albumArtist", MetaData->artist, "artist", MetaData->artist,
+		"trackNumber", MetaData->track);
+
+	if (MetaData->artwork) {
+		json_t* artwork = json_pack("{s[{ss}]}", "images", "url", MetaData->artwork);
+		json_object_update(json, artwork);
+		json_decref(artwork);
+	}
+
+	return json_pack("{so}", "metadata", json);
 }
 
 
 /*----------------------------------------------------------------------------*/
-bool CastIsMediaSession(void *p)
-{
-	tCastCtx *Ctx = (tCastCtx*) p;
-	bool status;
-
+bool CastIsConnected(struct sCastCtx *Ctx) {
 	if (!Ctx) return false;
 
 	pthread_mutex_lock(&Ctx->Mutex);
-	status = Ctx->mediaSessionId != 0;
+	bool status = Ctx->Status >= CAST_CONNECTED;
+	pthread_mutex_unlock(&Ctx->Mutex);
+	return status;
+}
+
+/*----------------------------------------------------------------------------*/
+bool CastIsMediaSession(struct sCastCtx *Ctx) {
+	if (!Ctx) return false;
+
+	pthread_mutex_lock(&Ctx->Mutex);
+	bool status = Ctx->mediaSessionId != 0;
 	pthread_mutex_unlock(&Ctx->Mutex);
 
 	return status;
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastGetStatus(struct sCastCtx *Ctx)
-{
+void CastGetStatus(struct sCastCtx* Ctx) {
 	// SSL context might not be set yet
 	if (!Ctx) return;
 
 	pthread_mutex_lock(&Ctx->Mutex);
-	SendCastMessage(Ctx, CAST_RECEIVER, NULL, "{\"type\":\"GET_STATUS\",\"requestId\":%d}", Ctx->reqId++);
+
+	json_t* msg = json_pack("{ss,si}", "type", "GET_STATUS", "requestId", Ctx->reqId++);
+
+	char* str = json_dumps(msg, JSON_ENCODE_ANY | JSON_INDENT(1));
+	json_decref(msg);
+
+	SendCastMessage(Ctx, CAST_RECEIVER, NULL, "%s", str);
+	NFREE(str);
+
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastGetMediaStatus(struct sCastCtx *Ctx)
-{
+void CastGetMediaStatus(struct sCastCtx *Ctx) {
 	// SSL context might not be set yet
 	if (!Ctx) return;
 
 	pthread_mutex_lock(&Ctx->Mutex);
+
 	if (Ctx->mediaSessionId) {
-		SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId,
-						"{\"type\":\"GET_STATUS\",\"requestId\":%d,\"mediaSessionId\":%d}",
-						Ctx->reqId++, Ctx->mediaSessionId);
+		json_t* msg = json_pack("{ss,si,si}", "type", "GET_STATUS",
+								"mediaSessionId", Ctx->mediaSessionId,
+								"requestId", Ctx->reqId++); 
+		
+		char* str = json_dumps(msg, JSON_ENCODE_ANY | JSON_INDENT(1));
+		json_decref(msg);
+
+		SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId, "%s", str);
+		NFREE(str);
     }
+
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
-
 
 /*----------------------------------------------------------------------------*/
 #define LOAD_FLUSH
-bool CastLoad(struct sCastCtx *Ctx, char *URI, char *ContentType, struct metadata_s *MetaData)
-{
-	json_t *msg;
+bool CastLoad(struct sCastCtx *Ctx, char *URI, char *ContentType, const char *Name, struct metadata_s *MetaData, uint64_t StartTime) {
+	json_t *msg, *customData;
 	char* str;
 
 	if (!LaunchReceiver(Ctx)) {
@@ -100,32 +111,25 @@ bool CastLoad(struct sCastCtx *Ctx, char *URI, char *ContentType, struct metadat
 		return false;
 	}
 
-	msg = json_pack("{ss,ss,ss}", "contentId", URI, "streamType", "BUFFERED",
-					"contentType", ContentType);
+	msg = json_pack("{ss,ss,ss}", "contentId", URI, "streamType", (MetaData && !MetaData->duration) ? "LIVE" : "BUFFERED", 
+						          "contentType", ContentType);
 
-	if (MetaData) {
-		json_t *metadata = json_pack("{si,ss,ss,ss,ss,si}",
-							"metadataType", 3,
-							"albumName", MetaData->album, "title", MetaData->title,
-							"albumArtist", MetaData->artist, "artist", MetaData->artist,
-							"trackNumber", MetaData->track);
+	if (MetaData && MetaData->duration) {
+		json_t* duration = json_pack("{sf}", "duration", (double)MetaData->duration / 1000);
+		json_object_update(msg, duration);
+		json_decref(duration);
+	}
 
-		if (MetaData->artwork) {
-			json_t *artwork = json_pack("{s[{ss}]}", "images", "url", MetaData->artwork);
-			json_object_update(metadata, artwork);
-			json_decref(artwork);
-		}
+	if (StartTime) customData = json_pack("{s{sssI}}", "customData", "deviceName", Name, "startTime", StartTime);
+	else customData = json_pack("{s{ss}}", "customData", "deviceName", Name);
+	json_object_update(msg, customData);
+	json_decref(customData);
 
-		metadata = json_pack("{s,o}", "metadata", metadata);
+	json_t* jsonMetaData = BuildMetaData(MetaData);
 
-		json_object_update(msg, metadata);
-		json_decref(metadata);
-
-		if (MetaData->duration) {
-			json_t *duration = json_pack("{sf}", "duration", (double) MetaData->duration / 1000);
-			json_object_update(msg, duration);
-			json_decref(duration);
-		}
+	if (jsonMetaData) {
+		json_object_update(msg, jsonMetaData);
+		json_decref(jsonMetaData);
 	}
 
 	pthread_mutex_lock(&Ctx->Mutex);
@@ -160,9 +164,8 @@ bool CastLoad(struct sCastCtx *Ctx, char *URI, char *ContentType, struct metadat
 		NFREE(str);
 
 		LOG_INFO("[%p]: Immediate LOAD (id:%u)", Ctx->owner, Ctx->waitId);
-	}
-	// otherwise queue it for later
-	else {
+	} else {
+		// otherwise queue it for later
 		tReqItem *req = malloc(sizeof(tReqItem));
 #ifndef LOAD_FLUSH
 		// if waiting for a media, need to unlock queue and take precedence
@@ -170,19 +173,18 @@ bool CastLoad(struct sCastCtx *Ctx, char *URI, char *ContentType, struct metadat
 #endif
 		strcpy(req->Type, "LOAD");
 		req->data.msg = msg;
-		QueueInsert(&Ctx->reqQueue, req);
+		queue_insert(&Ctx->reqQueue, req);
 		LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
 	}
 
 	pthread_mutex_unlock(&Ctx->Mutex);
 
-	return true;
+
+	return true;
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastSimple(struct sCastCtx *Ctx, char *Type)
-{
+void CastSimple(struct sCastCtx *Ctx, char *Type) {
 	// lock on wait for a Cast response
 	pthread_mutex_lock(&Ctx->Mutex);
 
@@ -197,26 +199,74 @@ void CastSimple(struct sCastCtx *Ctx, char *Type)
 
 			LOG_INFO("[%p]: Immediate %s (id:%u)", Ctx->owner, Type, Ctx->waitId);
 
-		}
-		else {
+		} else {
 			LOG_WARN("[%p]: %s req w/o a session", Ctx->owner, Type);
 	   }
 
-	}
-	else {
+	} else {
 		tReqItem *req = malloc(sizeof(tReqItem));
 		strcpy(req->Type, Type);
-		QueueInsert(&Ctx->reqQueue, req);
+		queue_insert(&Ctx->reqQueue, req);
 		LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
 	}
 
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
+/*----------------------------------------------------------------------------*/
+void CastPlay(struct sCastCtx* Ctx, struct metadata_s* MetaData) {
+	// lock on wait for a Cast response
+	pthread_mutex_lock(&Ctx->Mutex);
+
+	json_t* customData;
+	if (MetaData && MetaData->live_duration != -1) customData = json_pack("{si}", "liveDuration", MetaData->live_duration);
+	else customData = json_object();
+
+	json_t* item = BuildMetaData(MetaData);
+
+	if (item) {
+		json_object_update(customData, item);
+		json_decref(item);
+	}
+
+	if (Ctx->Status == CAST_LAUNCHED && !Ctx->waitId) {
+		// no media session, nothing to do
+		if (Ctx->mediaSessionId) {
+			Ctx->waitId = Ctx->reqId++;
+
+			json_t* msg = json_pack("{ss,si,si}", "type", "PLAY", "requestId", Ctx->waitId,
+												  "mediaSessionId", Ctx->mediaSessionId);
+
+			item = json_pack("{so}", "customData", customData);
+			json_object_update(msg, item);
+			json_decref(item);
+
+			char* str = json_dumps(msg, JSON_ENCODE_ANY | JSON_INDENT(1));
+			json_decref(msg);
+
+			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId, "%s", str);
+			NFREE(str);
+
+			LOG_INFO("[%p]: Immediate PLAY (id:%u)", Ctx->owner, Ctx->waitId);
+
+		} else {
+			json_decref(customData);
+			LOG_WARN("[%p]: PLAY req w/o a session", Ctx->owner);
+		}
+
+	} else {
+		tReqItem* req = malloc(sizeof(tReqItem));
+		req->data.customData = customData;
+		strcpy(req->Type, "PLAY");
+		queue_insert(&Ctx->reqQueue, req);
+		LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
+	}
+
+	pthread_mutex_unlock(&Ctx->Mutex);
+}
 
 /*----------------------------------------------------------------------------*/
-void CastStop(struct sCastCtx *Ctx)
-{
+void CastStop(struct sCastCtx *Ctx) {
 	// lock on wait for a Cast response
 	pthread_mutex_lock(&Ctx->Mutex);
 
@@ -233,8 +283,7 @@ void CastStop(struct sCastCtx *Ctx)
 						"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->waitId);
 			Ctx->Status = CAST_CONNECTED;
 
-		}
-		else {
+		} else {
 			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId,
 							"{\"type\":\"STOP\",\"requestId\":%d,\"mediaSessionId\":%d}",
 							Ctx->waitId, Ctx->mediaSessionId);
@@ -248,7 +297,7 @@ void CastStop(struct sCastCtx *Ctx)
 
 		tReqItem *req = malloc(sizeof(tReqItem));
 		strcpy(req->Type, "STOP");
-		QueueInsert(&Ctx->reqQueue, req);
+		queue_insert(&Ctx->reqQueue, req);
 		LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
 
 	// launching happening, just go back to CONNECT mode
@@ -263,41 +312,34 @@ void CastStop(struct sCastCtx *Ctx)
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastPowerOff(struct sCastCtx *Ctx)
-{
+void CastPowerOff(struct sCastCtx *Ctx) {
 	CastRelease(Ctx);
 	CastDisconnect(Ctx);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastPowerOn(struct sCastCtx *Ctx)
-{
-	CastConnect(Ctx);
+bool CastPowerOn(struct sCastCtx *Ctx) {
+	return CastConnect(Ctx);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastRelease(struct sCastCtx *Ctx)
-{
+void CastRelease(struct sCastCtx *Ctx) {
 	pthread_mutex_lock(&Ctx->Mutex);
-	SendCastMessage(Ctx, CAST_RECEIVER, NULL,
-					"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->reqId++);
-	Ctx->Status = CAST_CONNECTED;
+	if (Ctx->Status != CAST_DISCONNECTED) {
+		SendCastMessage(Ctx, CAST_RECEIVER, NULL,
+						"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->reqId++);
+		Ctx->Status = CAST_CONNECTED;
+	}
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
 
 /*----------------------------------------------------------------------------*/
-void CastSetDeviceVolume(struct sCastCtx *Ctx, double Volume, bool Queue)
-{
-	if (Ctx->group) Volume = Volume * Ctx->MediaVolume;
-
-	if (Volume > 1.0) Volume = 1.0;
-
+void CastSetDeviceVolume(struct sCastCtx *Ctx, double Volume, bool Queue) {
 	pthread_mutex_lock(&Ctx->Mutex);
+	
+	if (Volume > 1.0) Volume = 1.0;
 
 	if (Ctx->Status == CAST_LAUNCHED && (!Ctx->waitId || !Queue)) {
 
@@ -319,32 +361,23 @@ void CastSetDeviceVolume(struct sCastCtx *Ctx, double Volume, bool Queue)
 		// Only set waitId if this is NOT queue bypass
 		if (Queue) Ctx->waitId = Ctx->reqId;
 
-		LOG_INFO("[%p]: Immediate VOLUME (id:%u)", Ctx->owner, Ctx->reqId);
+		LOG_DEBUG("[%p]: Immediate VOLUME (id:%u)", Ctx->owner, Ctx->reqId);
 
 		Ctx->reqId++;
-	}
-	// otherwise queue it for later
-	else {
+	} else {
+		// otherwise queue it for later
 		tReqItem *req = malloc(sizeof(tReqItem));
 		strcpy(req->Type, "SET_VOLUME");
-		req->data.Volume = Volume;
-		QueueInsert(&Ctx->reqQueue, req);
+		req->data.volume = Volume;
+		queue_insert(&Ctx->reqQueue, req);
 		LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
 	}
 
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
-/*----------------------------------------------------------------------------*/
-int CastSeek(char *ControlURL, unsigned Interval)
-{
-	int rc = 0;
-
-	return rc;
+/*----------------------------------------------------------------------------*/
+int CastSeek(char *ControlURL, unsigned Interval) {
+	return 0;
 }
 
-
-
-
-
-

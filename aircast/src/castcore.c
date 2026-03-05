@@ -1,32 +1,30 @@
 /*
- * Chromecast protocol handler
+ * Chromecast core protocol handler
  *
- *  (c) Philippe 2016-2017, philippe_44@outlook.com
+ *  (c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * See LICENSE
  *
  */
 
+#include <stdlib.h>
 #include <stdarg.h>
 
+#include "cross_log.h"
+#include "cross_net.h"
+#include "cross_thread.h"
 
-#include "log_util.h"
-#include "util.h"
 #include "cast_parse.h"
 #include "castcore.h"
 #include "castitf.h"
 
+#ifdef _WIN32
+#define bswap32(n) _byteswap_ulong((n))
+#elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define	bswap32(n) __builtin_bswap32((n))
+#else 
+#define bswap32(n) (n)
+#endif
 
 #define SELECT_SOCKET
 
@@ -40,118 +38,17 @@ static void *CastPingThread(void *args);
 extern log_level cast_loglevel;
 static log_level *loglevel = &cast_loglevel;
 
-#define DEFAULT_RECEIVER	"CC1AD845"
+//#define DEFAULT_RECEIVER	"CC1AD845"
+#define DEFAULT_RECEIVER	"46C1A819"
 
 /*----------------------------------------------------------------------------*/
-#if OSX
-static void set_nosigpipe(sockfd s) {
-	int set = 1;
-	setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (void *)&set, sizeof(int));
-}
-#else
-#define set_nosigpipe(s)
-#endif
-
-
-/*----------------------------------------------------------------------------*/
-static void set_nonblock(sockfd s) {
-#if WIN
-	u_long iMode = 1;
-	ioctlsocket(s, FIONBIO, &iMode);
-#else
-	int flags = fcntl(s, F_GETFL,0);
-	fcntl(s, F_SETFL, flags | O_NONBLOCK);
-#endif
+static void CastExit(void) {
+	if (glSSLctx) SSL_CTX_free(glSSLctx);
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void set_block(sockfd s) {
-#if WIN
-	u_long iMode = 0;
-	ioctlsocket(s, FIONBIO, &iMode);
-#else
-	int flags = fcntl(s, F_GETFL,0);
-	fcntl(s, F_SETFL, flags & (~O_NONBLOCK));
-#endif
-}
-
-
-/*----------------------------------------------------------------------------*/
-static int connect_timeout(sockfd sock, const struct sockaddr *addr, socklen_t addrlen, int timeout) {
-	fd_set w, e;
-	struct timeval tval;
-
-	if (connect(sock, addr, addrlen) < 0) {
-#if !WIN
-		if (last_error() != EINPROGRESS) {
-#else
-		if (last_error() != WSAEWOULDBLOCK) {
-#endif
-			return -1;
-		}
-	}
-
-	FD_ZERO(&w);
-	FD_SET(sock, &w);
-	e = w;
-	tval.tv_sec = timeout / 1000;
-	tval.tv_usec = (timeout - tval.tv_sec * 1000) * 1000;
-
-	// only return 0 if w set and sock error is zero, otherwise return error code
-	if (select(sock + 1, NULL, &w, &e, timeout ? &tval : NULL) == 1 && FD_ISSET(sock, &w)) {
-		int	error = 0;
-		socklen_t len = sizeof(error);
-		getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&error, &len);
-		return error;
-	}
-
-	return -1;
-}
-
-
-/*----------------------------------------------------------------------------*/
-void InitSSL(void)
-{
-	const SSL_METHOD *method;
-
-	// initialize SSL stuff
-	// SSL_load_error_strings();
-	SSL_library_init();
-
-	// build the SSL objects...
-	method = SSLv23_client_method();
-
-	glSSLctx = SSL_CTX_new(method);
-	SSL_CTX_set_options(glSSLctx, SSL_OP_NO_SSLv2);
-}
-
-
-/*----------------------------------------------------------------------------*/
-void EndSSL(void)
-{
-	SSL_CTX_free(glSSLctx);
-}
-
-
-/*----------------------------------------------------------------------------*/
-void swap32(u32_t *n)
-{
-#if SL_LITTLE_ENDIAN
-	u32_t buf = *n;
-	*n = 	(((u8_t) (buf >> 24))) +
-		(((u8_t) (buf >> 16)) << 8) +
-		(((u8_t) (buf >> 8)) << 16) +
-		(((u8_t) (buf)) << 24);
-#else
-#endif
-}
-
-
-/*----------------------------------------------------------------------------*/
-bool read_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, u16_t bytes)
-{
-	u16_t read = 0;
+static bool read_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, uint16_t bytes) {
+	uint16_t read = 0;
 	sockfd sock = SSL_get_fd(ssl);
 
 	if (sock == -1) return false;
@@ -175,7 +72,7 @@ bool read_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, u16_t bytes)
 #endif
 		ERR_clear_error();
 		pthread_mutex_lock(Mutex);
-		nb = SSL_read(ssl, (u8_t*) buffer + read, bytes - read);
+		nb = SSL_read(ssl, (uint8_t*) buffer + read, bytes - read);
 		pthread_mutex_unlock(Mutex);
 		if (nb <= 0) {
 			LOG_WARN("[s-%p]: SSL error code %d (err:%d)", ssl, SSL_get_error(ssl, nb), ERR_get_error());
@@ -187,29 +84,23 @@ bool read_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, u16_t bytes)
 	return true;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool write_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, u16_t bytes)
-{
-	bool ret;
-
+static bool write_bytes(pthread_mutex_t *Mutex, SSL *ssl, void *buffer, uint16_t bytes) {
 	pthread_mutex_lock(Mutex);
-	ret = SSL_write(ssl, buffer, bytes) > 0;
+	bool ret = SSL_write(ssl, buffer, bytes) > 0;
 	pthread_mutex_unlock(Mutex);
 
 	return ret;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool SendCastMessage(struct sCastCtx *Ctx, char *ns, char *dest, char *payload, ...)
-{
+ bool SendCastMessage(struct sCastCtx *Ctx, char *ns, char *dest, char *payload, ...) {
 	CastMessage message = CastMessage_init_default;
 	pb_ostream_t stream;
-	u8_t *buffer;
-	u16_t buffer_len = 4096;
+	uint8_t *buffer;
+	uint16_t buffer_len = 4096;
 	bool status;
-	u32_t len;
+	uint32_t len;
 	va_list args;
 
 	if (!Ctx->ssl) return false;
@@ -223,76 +114,61 @@ bool SendCastMessage(struct sCastCtx *Ctx, char *ns, char *dest, char *payload, 
 	if ((buffer = malloc(buffer_len)) == NULL) return false;
 	stream = pb_ostream_from_buffer(buffer, buffer_len);
 	status = pb_encode(&stream, CastMessage_fields, &message);
-	len = stream.bytes_written;
-	swap32(&len);
+	len = bswap32(stream.bytes_written);
 
 	status &= write_bytes(&Ctx->sslMutex, Ctx->ssl, &len, 4);
 	status &= write_bytes(&Ctx->sslMutex, Ctx->ssl, buffer, stream.bytes_written);
 
 	free(buffer);
 
-	if (!stristr(message.payload_utf8, "PING")) {
+	if (!strcasestr(message.payload_utf8, "PING")) {
 		LOG_DEBUG("[%p]: Cast sending: %s", Ctx->ssl, message.payload_utf8);
 	}
 
 	return status;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool DecodeCastMessage(u8_t *buffer, u16_t len, CastMessage *msg)
-{
-	bool status;
+static bool DecodeCastMessage(uint8_t *buffer, uint16_t len, CastMessage *msg) {
 	CastMessage message = CastMessage_init_zero;
 	pb_istream_t stream = pb_istream_from_buffer(buffer, len);
 
-	status = pb_decode(&stream, CastMessage_fields, &message);
+	bool status = pb_decode(&stream, CastMessage_fields, &message);
 	memcpy(msg, &message, sizeof(CastMessage));
 	return status;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool GetNextMessage(pthread_mutex_t *Mutex, SSL *ssl, CastMessage *message)
-{
-	bool status;
-	u32_t len;
-	u8_t *buf;
+static bool GetNextMessage(pthread_mutex_t *Mutex, SSL *ssl, CastMessage *message) {
+	uint32_t len;
+	uint8_t *buf;
 
 	// the SSL might just have been closed by another thread
 	if (!ssl || !read_bytes(Mutex, ssl, &len, 4)) return false;
 
-	swap32(&len);
-	if ((buf = malloc(len))== NULL) return false;
-	status = read_bytes(Mutex, ssl, buf, len);
+	len = bswap32(len);
+	if ((buf = malloc(len)) == NULL) return false;
+	bool status = read_bytes(Mutex, ssl, buf, len);
 	status &= DecodeCastMessage(buf, len, message);
+
 	free(buf);
 	return status;
 }
 
-
-
 /*----------------------------------------------------------------------------*/
-json_t *GetTimedEvent(void *p, u32_t msWait)
-{
-	json_t *data;
-	tCastCtx *Ctx = (tCastCtx*) p;
-
+json_t *GetTimedEvent(struct sCastCtx *Ctx, uint32_t msWait) {
 	pthread_mutex_lock(&Ctx->eventMutex);
 	pthread_cond_reltimedwait(&Ctx->eventCond, &Ctx->eventMutex, msWait);
-	data = QueueExtract(&Ctx->eventQueue);
+	json_t* data = queue_extract(&Ctx->eventQueue);
 	pthread_mutex_unlock(&Ctx->eventMutex);
 
 	return data;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool LaunchReceiver(tCastCtx *Ctx)
-{
+bool LaunchReceiver(tCastCtx *Ctx) {
 	// try to reconnect if SSL connection is lost
 	if (!CastConnect(Ctx)) {
-		pthread_mutex_unlock(&Ctx->Mutex);
 		return false;
 	}
 
@@ -313,7 +189,7 @@ bool LaunchReceiver(tCastCtx *Ctx)
 			} else {
 				tReqItem *req = malloc(sizeof(tReqItem));
 				strcpy(req->Type, "LAUNCH");
-				QueueInsert(&Ctx->reqQueue, req);
+				queue_insert(&Ctx->reqQueue, req);
 				LOG_INFO("[%p]: Queuing %s", Ctx->owner, req->Type);
 			 }
 			break;
@@ -327,10 +203,8 @@ bool LaunchReceiver(tCastCtx *Ctx)
 	return true;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool CastConnect(struct sCastCtx *Ctx)
-{
+bool CastConnect(struct sCastCtx *Ctx) {
 	int err;
 	struct sockaddr_in addr;
 
@@ -346,10 +220,10 @@ bool CastConnect(struct sCastCtx *Ctx)
 	set_nosigpipe(Ctx->sock);
 
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = S_ADDR(Ctx->ip);
+	addr.sin_addr.s_addr = Ctx->ip.s_addr;
 	addr.sin_port = htons(Ctx->port);
 
-	err = connect_timeout(Ctx->sock, (struct sockaddr *) &addr, sizeof(addr), 2*1000);
+	err = tcp_connect_timeout(Ctx->sock, addr, 3*1000);
 
 	if (err) {
 		closesocket(Ctx->sock);
@@ -378,15 +252,13 @@ bool CastConnect(struct sCastCtx *Ctx)
 	pthread_mutex_unlock(&Ctx->Mutex);
 
 	// wake up everybody who can be waiting
-	WakeAll();
+	crossthreads_wake();
 
 	return true;
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastDisconnect(struct sCastCtx *Ctx)
-{
+void CastDisconnect(struct sCastCtx *Ctx) {
 	pthread_mutex_lock(&Ctx->Mutex);
 
 	// powered off already
@@ -400,19 +272,18 @@ void CastDisconnect(struct sCastCtx *Ctx)
 	Ctx->Status = CAST_DISCONNECTED;
 	NFREE(Ctx->sessionId);
 	NFREE(Ctx->transportId);
-	QueueFlush(&Ctx->eventQueue);
+	queue_flush(&Ctx->eventQueue);
 	CastQueueFlush(&Ctx->reqQueue);
 
 	SSL_shutdown(Ctx->ssl);
+	SSL_clear(Ctx->ssl);
 	closesocket(Ctx->sock);
 
 	pthread_mutex_unlock(&Ctx->Mutex);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void SetMediaVolume(tCastCtx *Ctx, double Volume)
-{
+void SetMediaVolume(tCastCtx *Ctx, double Volume) {
 	if (Volume > 1.0) Volume = 1.0;
 
 	Ctx->waitId = Ctx->reqId++;
@@ -422,30 +293,32 @@ void SetMediaVolume(tCastCtx *Ctx, double Volume)
 						Ctx->waitId, Ctx->mediaSessionId, Volume);
 }
 
-
-
 /*----------------------------------------------------------------------------*/
-
-void *CreateCastDevice(void *owner, bool group, bool stopReceiver, struct in_addr ip, u16_t port, double MediaVolume)
-{
+void *CreateCastDevice(void *owner, bool group, bool stopReceiver, struct in_addr ip, uint16_t port, double MediaVolume) {
 	tCastCtx *Ctx = malloc(sizeof(tCastCtx));
 	pthread_mutexattr_t mutexAttr;
+
+	if (!glSSLctx) {
+		const SSL_METHOD* method = SSLv23_client_method();
+		glSSLctx = SSL_CTX_new(method);
+		SSL_CTX_set_options(glSSLctx, SSL_OP_NO_SSLv2);
+		atexit(CastExit);
+	}
 
 	Ctx->reqId 		= 1;
 	Ctx->waitId 	= Ctx->waitMedia = Ctx->mediaSessionId = 0;
 	Ctx->sessionId 	= Ctx->transportId = NULL;
 	Ctx->owner 		= owner;
-	Ctx->ssl 		= NULL;
 	Ctx->Status 	= CAST_DISCONNECTED;
 	Ctx->ip 		= ip;
 	Ctx->port		= port;
-	Ctx->MediaVolume  = MediaVolume;
+	Ctx->mediaVolume  = MediaVolume;
 	Ctx->group 		= group;
 	Ctx->stopReceiver = stopReceiver;
 	Ctx->ssl  		= SSL_new(glSSLctx);
 
-	QueueInit(&Ctx->eventQueue, false, NULL);
-	QueueInit(&Ctx->reqQueue, false, NULL);
+	queue_init(&Ctx->eventQueue, false, NULL);
+	queue_init(&Ctx->reqQueue, false, NULL);
 	pthread_mutexattr_init(&mutexAttr);
 	pthread_mutexattr_settype(&mutexAttr, PTHREAD_MUTEX_RECURSIVE);
 	pthread_mutex_init(&Ctx->Mutex, &mutexAttr);
@@ -460,10 +333,8 @@ void *CreateCastDevice(void *owner, bool group, bool stopReceiver, struct in_add
 	return Ctx;
 }
 
-
 /*----------------------------------------------------------------------------*/
-bool UpdateCastDevice(struct sCastCtx *Ctx, struct in_addr ip, u16_t port)
-{
+bool UpdateCastDevice(struct sCastCtx *Ctx, struct in_addr ip, uint16_t port) {
 	if (Ctx->port != port || Ctx->ip.s_addr != ip.s_addr) {
 		LOG_INFO("[%p]: changed ip:port %s:%d", Ctx, inet_ntoa(ip), port);
 		pthread_mutex_lock(&Ctx->Mutex);
@@ -476,17 +347,13 @@ bool UpdateCastDevice(struct sCastCtx *Ctx, struct in_addr ip, u16_t port)
 	return false;
 }
 
-
 /*----------------------------------------------------------------------------*/
-struct in_addr GetAddr(struct sCastCtx *Ctx)
-{
+struct in_addr CastGetAddr(struct sCastCtx *Ctx) {
 	return Ctx->ip;
 }
 
-
 /*----------------------------------------------------------------------------*/
-void DeleteCastDevice(struct sCastCtx *Ctx)
-{
+void DeleteCastDevice(struct sCastCtx *Ctx) {
 	pthread_mutex_lock(&Ctx->Mutex);
 	Ctx->running = false;
 	pthread_mutex_unlock(&Ctx->Mutex);
@@ -494,7 +361,7 @@ void DeleteCastDevice(struct sCastCtx *Ctx)
 	CastDisconnect(Ctx);
 
 	// wake up cast communication & ping threads
-	WakeAll();
+	crossthreads_wake();
 
 	pthread_join(Ctx->PingThread, NULL);
 	pthread_join(Ctx->Thread, NULL);
@@ -514,24 +381,22 @@ void DeleteCastDevice(struct sCastCtx *Ctx)
 	free(Ctx);
 }
 
-
 /*----------------------------------------------------------------------------*/
-void CastQueueFlush(tQueue *Queue)
-{
+void CastQueueFlush(cross_queue_t *Queue) {
 	tReqItem *item;
 
-	while ((item = QueueExtract(Queue)) != NULL) {
+	while ((item = queue_extract(Queue)) != NULL) {
 		if (!strcasecmp(item->Type,"LOAD")) json_decref(item->data.msg);
+		else if (!strcasecmp(item->Type, "PLAY") && item->data.customData) json_decref(item->data.customData);
 		free(item);
 	}
 }
 
-
 /*----------------------------------------------------------------------------*/
-void ProcessQueue(tCastCtx *Ctx) {
+static void ProcessQueue(tCastCtx *Ctx) {
 	tReqItem *item;
 
-	if ((item = QueueExtract(&Ctx->reqQueue)) == NULL) return;
+	if ((item = queue_extract(&Ctx->reqQueue)) == NULL) return;
 
 	if (!strcasecmp(item->Type, "LAUNCH")) {
 		Ctx->waitId = Ctx->reqId++;
@@ -542,6 +407,7 @@ void ProcessQueue(tCastCtx *Ctx) {
 		SendCastMessage(Ctx, CAST_RECEIVER, NULL, "{\"type\":\"LAUNCH\",\"requestId\":%d,\"appId\":\"%s\"}", Ctx->waitId, DEFAULT_RECEIVER);
 	}
 
+#if 0
 	if (!strcasecmp(item->Type, "GET_MEDIA_STATUS") && Ctx->mediaSessionId) {
 		Ctx->waitId = Ctx->reqId++;
 
@@ -559,19 +425,19 @@ void ProcessQueue(tCastCtx *Ctx) {
 
 		SendCastMessage(Ctx, CAST_RECEIVER, NULL, "{\"type\":\"GET_STATUS\",\"requestId\":%d}", Ctx->waitId);
 	}
+#endif
 
 	if (!strcasecmp(item->Type, "SET_VOLUME")) {
 
-		if (item->data.Volume) {
+		if (item->data.volume) {
 			SendCastMessage(Ctx, CAST_RECEIVER, NULL,
 							"{\"type\":\"SET_VOLUME\",\"requestId\":%d,\"volume\":{\"level\":%0.4lf}}",
-							Ctx->reqId++, item->data.Volume);
+							Ctx->reqId++, item->data.volume);
 
 			SendCastMessage(Ctx, CAST_RECEIVER, NULL,
 							"{\"type\":\"SET_VOLUME\",\"requestId\":%d,\"volume\":{\"muted\":false}}",
 							Ctx->reqId);
-		}
-		else {
+		} else {
 			SendCastMessage(Ctx, CAST_RECEIVER, NULL,
 							"{\"type\":\"SET_VOLUME\",\"requestId\":%d,\"volume\":{\"muted\":true}}",
 							Ctx->reqId);
@@ -588,11 +454,20 @@ void ProcessQueue(tCastCtx *Ctx) {
 
 			LOG_INFO("[%p]: Processing %s (id:%u)", Ctx->owner, item->Type, Ctx->waitId);
 
-			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId,
-							"{\"type\":\"%s\",\"requestId\":%d,\"mediaSessionId\":%d}",
-							item->Type, Ctx->waitId, Ctx->mediaSessionId);
-		}
-		else {
+			json_t* msg = json_pack("{ss,si,si}", "type", "PLAY", "requestId", Ctx->waitId,
+												  "mediaSessionId", Ctx->mediaSessionId);
+
+			json_t* customData = json_pack("{so}", "customData", item->data.customData);
+			json_object_update(msg, customData);
+			json_decref(customData);
+
+			char* str = json_dumps(msg, JSON_ENCODE_ANY | JSON_INDENT(1));
+			json_decref(msg);
+
+			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId, "%s", str);
+			NFREE(str);
+		} else {
+			if (item->data.customData) json_decref(item->data.customData);
 			LOG_WARN("[%p]: PLAY un-queued but no media session", Ctx->owner);
 		}
 	}
@@ -629,8 +504,7 @@ void ProcessQueue(tCastCtx *Ctx) {
 						"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->waitId);
 			Ctx->Status = CAST_CONNECTED;
 
-		}
-		else if (Ctx->mediaSessionId) {
+		} else if (Ctx->mediaSessionId) {
 			SendCastMessage(Ctx, CAST_MEDIA, Ctx->transportId,
 							"{\"type\":\"STOP\",\"requestId\":%d,\"mediaSessionId\":%d}",
 							Ctx->waitId, Ctx->mediaSessionId);
@@ -642,17 +516,15 @@ void ProcessQueue(tCastCtx *Ctx) {
    free(item);
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void *CastPingThread(void *args)
-{
+static void *CastPingThread(void *args) {
 	tCastCtx *Ctx = (tCastCtx*) args;
-	u32_t last = gettime_ms();
+	uint32_t last = gettime_ms();
 
 	Ctx->running = true;
 
 	while (Ctx->running) {
-		u32_t now = gettime_ms();
+		uint32_t now = gettime_ms();
 
 		if (now - last > 3000 && Ctx->Status != CAST_DISCONNECTED) {
 			pthread_mutex_lock(&Ctx->Mutex);
@@ -673,19 +545,19 @@ static void *CastPingThread(void *args)
 			last = now;
 		}
 
-		WakeableSleep(1500);
+		crossthreads_sleep(1500);
 	}
 
-	// clear SSL error allocated memorry
-	ERR_remove_state(0);
+#ifdef OPENSSL_NO_DEPRECATED_1_1_0
+	// clear SSL error allocated memory
+	ERR_remove_thread_state(NULL);
+#endif
 
 	return NULL;
 }
 
-
 /*----------------------------------------------------------------------------*/
-static void *CastSocketThread(void *args)
-{
+static void *CastSocketThread(void *args) {
 	tCastCtx *Ctx = (tCastCtx*) args;
 	CastMessage Message;
 	json_t *root, *val;
@@ -700,7 +572,7 @@ static void *CastSocketThread(void *args)
 
 		// allow "virtual" power off
 		if (Ctx->Status == CAST_DISCONNECTED) {
-			WakeableSleep(0);
+			crossthreads_sleep(0);
 			continue;
 		}
 
@@ -732,8 +604,8 @@ static void *CastSocketThread(void *args)
 
 			LOG_SDEBUG("(s:%s) (d:%s)\n%s", Message.source_id, Message.destination_id, Message.payload_utf8);
 
-			// Connection closed by peer
 			if (!strcasecmp(str, "CLOSE")) {
+				// Connection closed by peer
 				Ctx->Status = CAST_CONNECTED;
 				Ctx->waitId = 0;
 				ProcessQueue(Ctx);
@@ -742,17 +614,13 @@ static void *CastSocketThread(void *args)
 					json_decref(root);
 					forward = false;
 				}
-			}
-
-			// respond to device ping
-			if (!strcasecmp(str,"PING")) {
+			} else if (!strcasecmp(str,"PING")) {
+				// respond to device ping
 				SendCastMessage(Ctx, CAST_BEAT, Message.source_id, "{\"type\":\"PONG\"}");
 				json_decref(root);
 				forward = false;
-			}
-
-			// receiving pong
-			if (!strcasecmp(str,"PONG")) {
+			} else if (!strcasecmp(str,"PONG")) {
+				// receiving pong
 				Ctx->lastPong = gettime_ms();
 				// connection established, start receiver was requested
 				if (Ctx->Status == CAST_AUTOLAUNCH) {
@@ -768,14 +636,14 @@ static void *CastSocketThread(void *args)
 
 			LOG_SDEBUG("[%p]: recvID %u (waitID %u)", Ctx, requestId, Ctx->waitId);
 
-			// expected request acknowledge
+			// expected request acknowledge (we know that str is still valid)
 			if (Ctx->waitId && Ctx->waitId == requestId) {
 
 				// reset waitId, might be set below
 				Ctx->waitId = 0;
 
-				// receiver status before connection is fully established
 				if (!strcasecmp(str,"RECEIVER_STATUS") && Ctx->Status == CAST_LAUNCHING) {
+					// receiver status before connection is fully established
 					const char *str;
 
 					NFREE(Ctx->sessionId);
@@ -794,10 +662,8 @@ static void *CastSocketThread(void *args)
 
 					json_decref(root);
 					forward = false;
-				}
-
-				// media status only acquired for expected id
-				if (!strcasecmp(str,"MEDIA_STATUS") && Ctx->waitMedia == requestId) {
+				} else if (!strcasecmp(str,"MEDIA_STATUS") && Ctx->waitMedia == requestId) {
+					// media status only acquired for expected id
 					int id = GetMediaItem_I(root, 0, "mediaSessionId");
 
 					if (id) {
@@ -805,7 +671,7 @@ static void *CastSocketThread(void *args)
 						Ctx->mediaSessionId = id;
 						LOG_INFO("[%p]: Media session id %d", Ctx->owner, Ctx->mediaSessionId);
 						// set media volume when session is re-connected
-						SetMediaVolume(Ctx, Ctx->MediaVolume);
+						SetMediaVolume(Ctx, Ctx->mediaVolume);
 					} else {
 						LOG_ERROR("[%p]: waitMedia match but no session %u", Ctx->owner, Ctx->waitMedia);
 					}
@@ -825,19 +691,16 @@ static void *CastSocketThread(void *args)
 		// queue event and signal handler
 		if (forward) {
 			pthread_mutex_lock(&Ctx->eventMutex);
-			QueueInsert(&Ctx->eventQueue, root);
+			queue_insert(&Ctx->eventQueue, root);
 			pthread_cond_signal(&Ctx->eventCond);
 			pthread_mutex_unlock(&Ctx->eventMutex);
 		}
 	}
 
+#ifdef OPENSSL_NO_DEPRECATED_1_1_0
 	// clear SSL error allocated memorry
-	ERR_remove_state(0);
+	ERR_remove_thread_state(NULL);
+#endif
 
 	return NULL;
 }
-
-
-
-
-

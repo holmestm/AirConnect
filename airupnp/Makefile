@@ -1,79 +1,99 @@
-BASE		= ../..
-
-TOOLS		= ../tools
-COMMON		= ../common
-SRC			= ./src
-MDNSSD		= $(BASE)/mdnssd
-TINYSVCMDNS	= $(BASE)/tinysvcmdns
-VALGRIND	= $(BASE)/valgrind
-UPNP 		= $(BASE)/libupnp/1.6.19
-JANSSON		= $(BASE)/jansson
-SHINE		= $(BASE)/shine/src/lib
-DMAP_PARSER	= $(BASE)/dmap-parser
-
-DEFINES 	+= -D_FILE_OFFSET_BITS=64 -DPB_FIELD_16BIT -DHAVE_STDINT_H -DNDEBUG -D_GNU_SOURCE -D_USE_XML_
-
-CFLAGS 		+= -fdata-sections -ffunction-sections 
-
-ifeq ($(OS),Darwin)
-LDFLAGS 	+= -Wl,-dead_strip
-else ifneq ($(OS), SunOS)
-LDFLAGS 	+= -Wl,--gc-sections
+ifeq ($(CC),cc)
+CC=$(lastword $(subst /, ,$(shell readlink -f `which cc`)))
 endif
 
-vpath %.c $(TOOLS):$(COMMON):$(SRC):$(SQUEEZETINY):$(MDNSSD):$(TINYSVCMDNS):$(DMAP_PARSER)
+ifeq ($(findstring gcc,$(CC)),gcc)
+CFLAGS  += -Wno-deprecated-declarations -Wno-format-truncation -Wno-stringop-truncation 
+LDFLAGS += -s
+else
+CFLAGS += -fno-temp-file
+endif
 
-INCLUDE = -I. \
-		  -I$(SHINE) \
-		  -I$(DMAP_PARSER) \
-		  -I$(VALGRIND)/memcheck -I$(VALGRIND)/include \
+PLATFORM ?= $(firstword $(subst -, ,$(CC)))
+HOST ?= $(word 2, $(subst -, ,$(CC)))
+
+ifneq ($(HOST),macos)
+ifneq ($(HOST),solaris)
+LINKSTATIC = -static -latomic
+else
+LDFLAGS += -lssp
+endif
+endif
+
+BASE              = ..
+CORE              = $(BASE)/bin/airupnp-$(HOST)
+BUILDDIR          = $(dir $(CORE))$(HOST)/$(PLATFORM)
+EXECUTABLE        = $(CORE)-$(PLATFORM)
+EXECUTABLE_STATIC = $(EXECUTABLE)-static
+
+SRC             = src
+COMMON		= $(BASE)/common
+TOOLS		= $(COMMON)/crosstools/src
+RAOP		= $(COMMON)/libraop/targets
+MDNS		= $(COMMON)/libmdns/targets
+#VALGRIND	= $(BASE)/valgrind
+PUPNP 		= $(COMMON)/libpupnp/targets/$(HOST)/$(PLATFORM)
+CODECS		= $(COMMON)/libcodecs/targets
+OPENSSL		= $(COMMON)/libopenssl/targets/$(HOST)/$(PLATFORM)
+
+DEFINES 	+= -DNDEBUG -D_GNU_SOURCE -DUPNP_STATIC_LIB
+CFLAGS  	+= -Wall -fPIC -ggdb -O2 $(DEFINES) -fdata-sections -ffunction-sections
+LDFLAGS 	+= -lpthread -ldl -lm -L.
+
+vpath %.c $(TOOLS):$(SRC):$(COMMON)
+
+INCLUDE = -I$(OPENSSL)/include \
+	  -I$(COMMON) \
+		  -I$(CODECS)/include/flac -I$(CODECS)/include/shine \
 		  -I$(TOOLS) \
-		  -I$(COMMON) \
-		  -I$(SRC) -I$(SRC)/inc \
-		  -I$(UPNP)/ixml/inc -I$(UPNP)/upnp/inc -I$(UPNP)/build/inc -I$(UPNP)/threadutil/inc \
-		  -I$(MDNSSD) \
-		  -I$(JANSSON)/src \
-		  -I$(BASE)/flac/include\
-		  -I$(TINYSVCMDNS)
-		  		  
-DEPS	= $(SRC)/airupnp.h
-				  
+		  -I$(SRC)/inc \
+		  -I$(RAOP)/include \
+		  -I$(PUPNP)/include/upnp -I$(PUPNP)/include/ixml -I$(PUPNP)/include/addons \
+		  -I$(MDNS)/include/mdnssvc -I$(MDNS)/include/mdnssd
+
+DEPS	= $(SRC)/airupnp.h $(LIBRARY) $(LIBRARY_STATIC)
+
 SOURCES = avt_util.c airupnp.c mr_util.c config_upnp.c  \
-		  alac.c base64.c hairtunes.c raopcore.c util.c log_util.c \
-		  dmap_parser.c \
-		  mdnssd-min.c \
-		  mdns.c mdnsd.c \
-		  sslsym.c
+	  cross_util.c cross_log.c cross_net.c cross_thread.c platform.c
 
-SOURCES_LIBS = 
-		
-OBJECTS 		= $(patsubst %.c,$(OBJ)/%.o,$(SOURCES)) $(patsubst %.c,$(OBJ)/%.o,$(SOURCES_LIBS)) 
-OBJECTS_STATIC 	= $(patsubst %.c,$(OBJ)/%.o,$(SOURCES)) $(patsubst %.c,$(OBJ)/%-static.o,$(SOURCES_LIBS)) 
+SOURCES_LIBS = cross_ssl.c
 
-LIBRARY 		= $(OBJ)/libixml.a $(OBJ)/libFLAC.a  $(OBJ)/libupnp.a  $(OBJ)/libthreadutil.a $(OBJ)/libshine.a
-LIBRARY_STATIC 	= $(LIBRARY) 
+OBJECTS		= $(patsubst %.c,$(BUILDDIR)/%.o,$(SOURCES) $(SOURCES_LIBS))
+OBJECTS_STATIC 	= $(patsubst %.c,$(BUILDDIR)/%.o,$(SOURCES)) $(patsubst %.c,$(BUILDDIR)/%-static.o,$(SOURCES_LIBS))
 
-all: $(EXECUTABLE) $(EXECUTABLE_STATIC)
+LIBRARY	= $(RAOP)/$(HOST)/$(PLATFORM)/libraop.a \
+			$(PUPNP)/libpupnp.a \
+			$(CODECS)/$(HOST)/$(PLATFORM)/libcodecs.a \
+			$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a
+
+LIBRARY_STATIC = $(LIBRARY) $(OPENSSL)/libopenssl.a
+
+all: directory $(EXECUTABLE) $(EXECUTABLE_STATIC)
 
 $(EXECUTABLE): $(OBJECTS)
-	$(CC) $(OBJECTS) $(LIBRARY) $(LDFLAGS) -o $@
-	
+	$(CC) $(OBJECTS) $(LIBRARY) $(CFLAGS) $(LDFLAGS) -o $@
+ifeq ($(HOST),macos)
+	rm -f $(CORE)
+	lipo -create -output $(CORE) $$(ls $(CORE)* | grep -v '\-static')
+endif
+
 $(EXECUTABLE_STATIC): $(OBJECTS_STATIC)
-	$(CC) $(OBJECTS_STATIC) $(LIBRARY_STATIC) $(LDFLAGS) -static -o $@	
+	$(CC) $(OBJECTS_STATIC) $(LIBRARY_STATIC) $(CFLAGS) $(LDFLAGS) $(LINKSTATIC) -o $@
+ifeq ($(HOST),macos)
+	rm -f $(CORE)-static
+	lipo -create -output $(CORE)-static $(CORE)-*-static
+endif
 
-$(OBJECTS): $(DEPS) | bin $(OBJ) 
+$(OBJECTS) $(OBJECTS_STATIC): $(DEPS)
 
-$(OBJ):
-	@mkdir -p $@
-	
-bin:	
-	@mkdir -p bin
+directory:
+	@mkdir -p $(BUILDDIR)
 
-$(OBJ)/%.o : %.c
+$(BUILDDIR)/%.o : %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
-$(OBJ)/%-static.o : %.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DLINKALL $(INCLUDE) $< -c -o $(OBJ)/$*-static.o	
-	
+$(BUILDDIR)/%-static.o : %.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DSSL_STATIC_LIB $(INCLUDE) $< -c -o $(BUILDDIR)/$*-static.o
+
 clean:
-	rm -f $(OBJECTS) $(EXECUTABLE) $(OBJECTS_STATIC) $(EXECUTABLE_STATIC) 
+	rm -f $(OBJECTS) $(EXECUTABLE) $(OBJECTS_STATIC) $(EXECUTABLE_STATIC) $(CORE) $(CORE)-static

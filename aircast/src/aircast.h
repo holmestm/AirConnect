@@ -1,38 +1,30 @@
 /*
  *  AirCast: Chromecast to AirPlay
  *
- *  (c) Philippe 2016-2017, philippe_44@outlook.com
+ *  (c) Philippe, philippe_44@outlook.com
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *  See LICENSE
  *
  */
 
-#ifndef __AIRCAST_H
-#define __AIRCAST_H
+#pragma once
 
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 
-#include "upnp.h"
 #include "platform.h"
 #include "pthread.h"
-#include "raopcore.h"
+#include "raop_server.h"
+#include "cast_util.h"
+
+#define VERSION "v1.9.3"" ("__DATE__" @ "__TIME__")"
 
 /*----------------------------------------------------------------------------*/
 /* typedefs */
 /*----------------------------------------------------------------------------*/
+
+#define STR_LEN	256
 
 #define MAX_PROTO		128
 #define MAX_RENDERERS	32
@@ -44,48 +36,52 @@
 #define	SCAN_TIMEOUT 	15
 #define SCAN_INTERVAL	30
 
-
 enum 	eMRstate { STOPPED, PLAYING, PAUSED };
 
 typedef struct sMRConfig
 {
 	bool		Enabled;
 	bool		StopReceiver;
-	char		Name[_STR_LEN_];
-	char		Codec[_STR_LEN_];
+	char		Name[STR_LEN];
+	char		Codec[STR_LEN];
 	bool		Metadata;
+	bool		Flush;
 	double		MediaVolume;
-	u8_t		mac[6];
-	char		Latency[_STR_LEN_];
+	uint8_t		mac[6];
+	char		Latency[STR_LEN];
 	bool		Drift;
-	char		ArtWork[4*_STR_LEN_];
+	char		ArtWork[4*STR_LEN];
 } tMRConfig;
 
 struct sMR {
-	u32_t Magic;
+	uint32_t Magic;
 	bool  Running;
 	tMRConfig Config;
-	struct raop_ctx_s *Raop;
-	raop_event_t	RaopState;
+	struct raopsr_s *Raop;
+	raopsr_event_t	RaopState;
 	char UDN	   	[RESOURCE_LENGTH];
+	char Name		[STR_LEN];
 	enum eMRstate 	State;
 	bool			ExpectStop;
-	u32_t			Elapsed;
+	uint32_t			Elapsed;
 	unsigned		TrackPoll;
 	void			*CastCtx;
 	pthread_mutex_t Mutex;
 	pthread_t 		Thread;
 	double			Volume;
+	uint32_t			VolumeStampRx, VolumeStampTx;
 	bool			Group;
 	struct sGroupMember {
 		struct sGroupMember	*Next;
 		struct in_addr		Host;
-		u16_t				Port;
+		uint16_t				Port;
    } *GroupMaster;
+   bool Remove;
 };
 
-extern s32_t				glLogLimit;
+extern int32_t				glLogLimit;
 extern tMRConfig			glMRConfig;
-extern struct sMR			glMRDevices[MAX_RENDERERS];
-
-#endif
+extern struct sMR			*glMRDevices;
+extern int					glMaxDevices;
+extern unsigned short		glPortBase, glPortRange;
+extern char					glBinding[16];
